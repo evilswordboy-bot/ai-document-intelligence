@@ -1,6 +1,6 @@
 """
 AI Document Intelligence MVP
-Zyroo AI/ML Internship - Week 2 Task
+Document Analysis & Information Extraction MVP
 
 An end-to-end document processing application built with Streamlit, PyMuPDF,
 Pillow, pytesseract, and regular expressions. It ingests PDFs and images,
@@ -638,7 +638,7 @@ def render_ui():
     # -------------------------------------------------------------
     with st.sidebar:
         st.title("📄 AI Doc Intelligence")
-        st.caption("Zyroo AI/ML Internship — Week 2")
+        st.caption("Document Analysis & Extraction MVP")
 
         st.markdown("---")
         st.subheader("Application")

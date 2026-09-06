@@ -2,7 +2,7 @@
 
 This directory stores demonstration screenshots of the application for evaluation and documentation.
 
-## Suggested Screenshots for Zyroo Internship Evaluation
+## Suggested Demonstration Screenshots
 
 ### 1. Upload & Initial State (`01_upload_screen.png`)
 - **What to show**: The main Streamlit interface with the title header, sidebar system status indicators (PDF Extraction, OCR Engine, Classification, Field Extraction), and the clean file upload area.

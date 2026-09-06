@@ -1,6 +1,6 @@
 # AI Document Intelligence
 
-**Zyroo AI/ML Internship — Week 2 Task**  
+**Document Analysis & Information Extraction Platform**  
 An end-to-end Document Intelligence MVP that automates document ingestion, text extraction, type classification, and structured field extraction with an intuitive Streamlit interface.
 
 ---
@@ -235,9 +235,9 @@ git push -u origin main
 
 ---
 
-## Evaluation Guide (For Zyroo AI/ML Evaluator)
+## Evaluation & Demonstration Guide
 
-When presenting this project during your internship evaluation:
+When presenting or demonstrating this project:
 1. **Explain the Architecture**: Highlight the separation between file ingestion, extraction (PyMuPDF with OCR fallback), classification, and field parsing.
 2. **Demonstrate Both Invoice & Resume**: Use the sidebar sample loader to demonstrate `invoice_1.pdf`, `invoice_2.pdf`, and `resume_1.pdf` live.
 3. **Showcase Truthfulness**: Point out that when a field cannot be matched with confidence, it cleanly outputs `"Not found"` rather than hallucinating fake data.
