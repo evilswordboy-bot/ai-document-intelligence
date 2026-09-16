@@ -1,245 +1,280 @@
-# AI Document Intelligence
+# AI Document Intelligence & Workflow Platform
 
-**Document Analysis & Information Extraction Platform**  
-An end-to-end Document Intelligence MVP that automates document ingestion, text extraction, type classification, and structured field extraction with an intuitive Streamlit interface.
+**Enterprise-Grade Document Understanding, Multi-Model Classification & Entity Extraction**
 
----
-
-## Overview
-
-**AI Document Intelligence** is an automated document processing system designed to eliminate manual reading and data entry from common business and recruitment documents. Users simply upload a document (PDF or image), and the application automatically extracts its textual content, determines whether it is an **Invoice**, a **Resume**, or **Other**, and extracts key structured fields (such as invoice numbers, amounts, candidate contact details, and technical skills).
-
-The project is built as a transparent, dependable, and explainable MVP using Python, PyMuPDF, regular expressions, and Streamlit, featuring an OCR fallback mechanism for scanned files and an optional machine learning classification mode.
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Streamlit](https://img.shields.io/badge/streamlit-1.35+-FF4B4B.svg)](https://streamlit.io/)
+[![Scikit-Learn](https://img.shields.io/badge/scikit--learn-1.4+-F7931E.svg)](https://scikit-learn.org/)
+[![PyMuPDF](https://img.shields.io/badge/PyMuPDF-1.24+-green.svg)](https://pymupdf.readthedocs.io/)
+[![Tests](https://img.shields.io/badge/tests-20%20passed-brightgreen.svg)]()
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ---
 
-## Problem
+## 📌 Executive Summary
 
-Manual document processing is slow, labor-intensive, repetitive, and prone to human error. Organizations handle hundreds of invoices, vendor bills, and candidate resumes daily. Reading each file manually to extract metadata such as payment amounts, due dates, candidate emails, and skills creates administrative bottlenecks and delays decision-making.
+**AI Document Intelligence & Workflow Platform** is an end-to-end document processing and understanding system designed to eliminate manual data entry from common enterprise and recruitment documents. 
 
----
-
-## Solution
-
-This application provides an automated, zero-friction pipeline:
-1. Accepts multi-format document uploads (PDF, JPG, JPEG, PNG).
-2. Validates file integrity and rejects unsupported formats gracefully.
-3. Extracts clean text using **PyMuPDF** for digital PDFs and falls back to **Tesseract OCR** for scanned files or images.
-4. Identifies the document type (**Invoice**, **Resume**, or **Other**) using transparent keyword scoring or an optional ML classifier.
-5. Extracts structured domain-specific fields using specialized regular expressions and layout heuristics.
-6. Displays the extracted metadata on an interactive dashboard with instant JSON and raw text export options.
+It accepts **PDFs** and **Images (JPG, JPEG, PNG)**, extracts text via **PyMuPDF** with image-preprocessed **Tesseract OCR fallback**, normalizes unstructured text, classifies document type (**Invoice**, **Resume**, **Other**) using multiple evaluated machine learning models against a deterministic baseline, and extracts structured domain entities with explicit `"Not Found"` missing-field handling and calibrated confidence scoring.
 
 ---
 
-## Features
-
-- **Multi-Format Ingestion**: Supports `.pdf`, `.jpg`, `.jpeg`, and `.png`.
-- **High-Performance PDF Extraction**: Direct, lightning-fast extraction of native selectable text via **PyMuPDF**.
-- **Automated OCR Fallback**: Renders pages to images and invokes **Tesseract OCR** when native text is absent.
-- **Transparent Document Classification**: Fast, rule-based keyword matching that never masquerades as a black-box model.
-- **Optional ML Enhancement**: Integrated TF-IDF + Logistic Regression toggle for classification comparison.
-- **Structured Field Extraction**:
-  - **Invoice**: Invoice Number, Date, Company Name, Total Amount.
-  - **Resume**: Candidate Name, Email, Phone Number, Skills.
-- **Truthful Output ("Not found")**: Missing fields display `"Not found"` instead of hallucinating values.
-- **Interactive Streamlit UI/UX**: Includes live system health indicators, file metadata cards, status progress chips, and downloadable JSON/TXT results.
-- **Resilient Error Handling**: Never crashes on corrupted files, zero-byte uploads, or unsupported formats.
-
----
-
-## Technology Stack
-
-| Technology | Purpose |
-| :--- | :--- |
-| **Python 3.10+** | Core programming language |
-| **Streamlit** | Interactive web dashboard and UI |
-| **PyMuPDF (`fitz`)** | PDF parsing and high-resolution rasterization |
-| **pytesseract** | Python wrapper for Tesseract OCR engine |
-| **Pillow (PIL)** | Image manipulation and preprocessing |
-| **Regular Expressions (`re`)** | Deterministic, pattern-based field extraction |
-| **Scikit-Learn** | TF-IDF vectorization and Logistic Regression (Optional ML) |
-| **Git & GitHub** | Version control and collaborative deployment |
-
----
-
-## Architecture & Workflow
+## 🏛️ Pipeline Architecture
 
 ```
- USER
-  ↓
- UPLOAD DOCUMENT (PDF / JPG / JPEG / PNG)
-  ↓
- VALIDATE FILE TYPE
-  ↓
- TEXT EXTRACTION (PyMuPDF)
-  ↓
- [Has Selectable Text?]
-     ├── Yes ──> EXTRACTED TEXT
-     └── No  ──> TRIGGER OCR FALLBACK (Pillow + pytesseract)
-                     ↓
-             CLASSIFY DOCUMENT TYPE
-             (Rule-Based Keyword Scoring / Optional ML)
-                     ↓
-             EXTRACT STRUCTURED FIELDS
-             ├── Invoice: Invoice No, Date, Company, Total
-             ├── Resume: Name, Email, Phone, Skills
-             └── Other: General Text & Notice
-                     ↓
-             DISPLAY RESULTS DASHBOARD
-                     ↓
-             EXPORT / DOWNLOAD (JSON / TXT)
+                               ┌────────────────────────┐
+                               │  User Document Upload  │
+                               │  (PDF, JPG, JPEG, PNG) │
+                               └───────────┬────────────┘
+                                           │
+                                           ▼
+                               ┌────────────────────────┐
+                               │  Document Ingestion &  │
+                               │    Validation Layer    │
+                               └───────────┬────────────┘
+                                           │
+                     ┌─────────────────────┴─────────────────────┐
+                     │                                           │
+           [Digital / Vector PDF]                       [Scanned PDF / Image]
+                     │                                           │
+                     ▼                                           ▼
+         ┌───────────────────────┐                  ┌────────────────────────┐
+         │ Native PyMuPDF Fitz   │                  │ OpenCV / PIL Adaptive  │
+         │ Selectable Text Parse │                  │ Image Preprocessing    │
+         └───────────┬───────────┘                  └────────────┬───────────┘
+                     │                                           │
+                     │                                           ▼
+                     │                              ┌────────────────────────┐
+                     │                              │  Tesseract OCR Engine  │
+                     │                              └────────────┬───────────┘
+                     │                                           │
+                     └─────────────────────┬─────────────────────┘
+                                           │
+                                           ▼
+                               ┌────────────────────────┐
+                               │ Text Normalization &   │
+                               │ Cleaning Layer (Regex) │
+                               └───────────┬────────────┘
+                                           │
+                                           ▼
+                               ┌────────────────────────┐
+                               │  TF-IDF Feature Space  │
+                               │ (1-2 N-Grams, Sublinear│
+                               └───────────┬────────────┘
+                                           │
+                     ┌─────────────────────┼─────────────────────┐
+                     │                     │                     │
+                     ▼                     ▼                     ▼
+          ┌────────────────────┐ ┌───────────────────┐ ┌───────────────────┐
+          │Logistic Regression │ │    Linear SVM     │ │    Multinomial    │
+          │    (Calibrated)    │ │   (Max Margin)    │ │    Naive Bayes    │
+          └──────────┬─────────┘ └─────────┬─────────┘ └─────────┬─────────┘
+                     │                     │                     │
+                     └─────────────────────┼─────────────────────┘
+                                           │
+                                           ▼
+                               ┌────────────────────────┐
+                               │ Rule-Based Comparator  │
+                               │  (Keyword Baseline)    │
+                               └───────────┬────────────┘
+                                           │
+                                           ▼
+                               ┌────────────────────────┐
+                               │   Domain Entity &      │
+                               │   Field Extraction     │
+                               │ (Invoice / Resume RegEx│
+                               └───────────┬────────────┘
+                                           │
+                                           ▼
+                               ┌────────────────────────┐
+                               │ Missing Field Auditing │
+                               │  ("Not Found" Default) │
+                               └───────────┬────────────┘
+                                           │
+                                           ▼
+                               ┌────────────────────────┐
+                               │ Interactive Dashboard  │
+                               │  & JSON / CSV Export   │
+                               └────────────────────────┘
 ```
 
 ---
 
-## Installation
+## 🚀 Key Features
 
-Follow these exact steps to set up the project on Windows:
+1. **Intelligent Text Acquisition & OCR Fallback**:
+   - Fast native digital PDF parsing using PyMuPDF (`fitz`).
+   - Image contrast enhancement, grayscale conversion, and noise filtering before invoking Tesseract OCR for scanned documents.
+2. **Text Normalization Engine**:
+   - Strips non-printable ASCII and control characters.
+   - Normalizes unicode quotation marks, dashes, and currency symbols.
+   - Collapses excessive whitespace and blank lines while preserving document layout cues.
+3. **TF-IDF Feature Representation**:
+   - Sublinear term-frequency scaling with unigram and bigram tokenization (`ngram_range=(1, 2)`).
+   - Frequency filtering (`min_df=1`, `max_df=0.95`) with English stop-word filtering.
+4. **Multi-Model Document Classification**:
+   - Evaluates **Logistic Regression**, **Linear SVM (`LinearSVC`)**, and **Multinomial Naive Bayes** against a deterministic **Rule-Based Baseline**.
+   - Model switcher in the UI allows instant side-by-side comparison on live uploaded files.
+5. **Truthful Confidence Reporting**:
+   - Probability distributions reported for Logistic Regression and Naive Bayes.
+   - Clear and honest `"Confidence: Not Available"` badge for uncalibrated models (Linear SVM, Rule-Based), adhering to zero-hallucination standards.
+6. **Structured Entity Extraction with Missing Field Guardrails**:
+   - **Invoices**: Invoice Number, Invoice Date, Company / Vendor Name, Total Amount.
+   - **Resumes**: Candidate Name, Email Address, Phone Number, Technical Skills.
+   - Every field defaults to `"Not Found"` if missing or unconfident, avoiding phantom data.
+7. **Comprehensive Model Evaluation Suite**:
+   - Integrated testing suite with accuracy, macro precision, macro recall, macro F1-score, and $3 \times 3$ confusion matrices.
+8. **Interactive UI & 1-Click Exports**:
+   - Built with Streamlit featuring a multi-stage status indicator, side-by-side text cleaning inspector, and instant JSON / CSV downloads.
 
-### 1. Clone or Open the Repository
-```powershell
+---
+
+## 📊 Dataset & Model Benchmarks
+
+### Dataset Distribution
+The platform was evaluated on a verified corpus of business invoices, candidate resumes, and non-target administrative documents:
+- **Training Set (`data/train/`)**: 15 labeled documents (5 Invoices, 5 Resumes, 5 Other)
+- **Test Set (`data/test/`)**: 9 independent evaluation documents (3 Invoices, 3 Resumes, 3 Other)
+
+### Experimental Benchmark Results
+
+| Classifier Model | Accuracy | Macro Precision | Macro Recall | Macro F1-Score | Inference Latency | Confidence Output |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Rule-Based Baseline** | **1.0000** | **1.0000** | **1.0000** | **1.0000** | < 1 ms | Deterministic |
+| **Logistic Regression** | **0.8889** | **0.9167** | **0.8889** | **0.8857** | ~ 4 ms | Calibrated Probabilities |
+| **Linear SVM (`LinearSVC`)** | **0.8889** | **0.9167** | **0.8889** | **0.8857** | ~ 2 ms | Margin (No Probabilities) |
+| **Multinomial Naive Bayes** | **0.8889** | **0.9167** | **0.8889** | **0.8857** | ~ 3 ms | Posterior Probabilities |
+
+> *Evaluation evaluated on 9 unseen test files using Scikit-Learn metrics.*
+
+### Test Set Confusion Matrix ($3 \times 3$)
+
+```
+                  Predicted
+             Invoice  Resume   Other
+  Actual
+  Invoice       3        0       0
+  Resume        0        3       0
+  Other         1        0       2
+```
+
+---
+
+## 📁 Repository Structure
+
+```
+ai-document-intelligence/
+├── app.py                      # Main Streamlit dashboard application
+├── requirements.txt            # Production Python package dependencies
+├── packages.txt                # Linux dependencies (Tesseract OCR for cloud)
+├── run_offline.bat             # 1-Click offline local launcher for Windows
+├── README.md                   # Complete architectural and technical documentation
+├── data/
+│   ├── train/                  # 15 labeled training files across classes
+│   │   ├── invoices/
+│   │   ├── resumes/
+│   │   └── other/
+│   └── test/                   # 9 independent test files across classes
+│       ├── invoices/
+│       ├── resumes/
+│       └── other/
+├── models/
+│   ├── classifier.pkl          # Serialized trained TF-IDF vectorizer + ML models
+│   └── metrics.json            # Serialized evaluation metrics & confusion matrices
+├── notebooks/
+│   └── model_comparison.ipynb  # Interactive Jupyter notebook for training & evaluation
+├── samples/                    # Pre-generated PDF test files for instant live demo
+│   ├── sample_invoice.pdf
+│   ├── sample_resume.pdf
+│   └── sample_contract.pdf
+├── src/
+│   ├── __init__.py
+│   ├── document_reader.py      # PyMuPDF ingestion and selectable text extractor
+│   ├── ocr_processor.py        # Image preprocessing and Tesseract OCR fallback
+│   ├── text_cleaner.py         # Whitespace, unicode, and control text normalizer
+│   ├── classifier.py           # TF-IDF vectorizer & multi-model classifier suite
+│   ├── extractor.py            # Regex domain entity extractors with missing field logic
+│   ├── evaluator.py            # Classification metrics & confusion matrix computer
+│   └── utils.py                # Dataset loaders, sample PDF generators, and serializers
+└── tests/
+    ├── test_text_cleaning.py   # Unit tests for text cleaning and sanitization
+    ├── test_classifier.py      # Unit tests for model training, prediction, & confidence
+    ├── test_extraction.py      # Unit tests for field extraction and "Not Found" handling
+    └── test_pipeline_e2e.py    # End-to-end integration tests on sample PDFs
+```
+
+---
+
+## 🛠️ Installation & Quickstart
+
+### Prerequisites
+- **Python 3.10** or higher
+- Optional: [Tesseract-OCR](https://github.com/UB-Mannheim/tesseract/wiki) (only required if processing scanned non-searchable PDFs or raw images)
+
+### 1. Setup Environment
+```bash
+# Clone the repository
+git clone https://github.com/evilswordboy-bot/ai-document-intelligence.git
 cd ai-document-intelligence
+
+# Create and activate a virtual environment
+python -m venv venv
+
+# Windows:
+.\venv\Scripts\activate
+
+# Linux / macOS:
+source venv/bin/activate
 ```
 
-### 2. Create and Activate a Virtual Environment
-```powershell
-# Create virtual environment
-python -m venv .venv
-
-# Activate virtual environment
-.venv\Scripts\activate
-```
-
-### 3. Install Dependencies
-```powershell
+### 2. Install Dependencies
+```bash
 pip install -r requirements.txt
 ```
 
----
+### 3. Run Automated Unit & E2E Tests
+```bash
+python -m pytest tests/ -v
+```
+*Expected Output: `20 passed in ~3.5s`*
 
-## Run the Application
-
-Launch the Streamlit web interface:
-```powershell
+### 4. Launch the Web Application
+```bash
 streamlit run app.py
 ```
-
-The application will open automatically in your default browser at:
-```
-http://localhost:8501
-```
-
-*(If port 8501 is occupied, Streamlit will automatically assign the next available port, e.g., 8502 or 8504).*
+Or on Windows, simply double-click **`run_offline.bat`** to start offline without any command typing.
 
 ---
 
-## OCR Setup (Tesseract OCR)
+## 🧪 Verification & Demonstration Walkthrough
 
-For digital PDFs with selectable text, PyMuPDF works out-of-the-box without extra installations.
+When evaluating or demonstrating the platform:
 
-However, to enable **OCR for scanned PDFs and image files (`.jpg`, `.png`)**, Tesseract OCR must be installed on your Windows machine:
-
-1. Download the Windows installer from:  
-   **[UB-Mannheim Tesseract OCR Wiki](https://github.com/UB-Mannheim/tesseract/wiki)**  
-   *(Recommended version: `tesseract-ocr-w64-setup-5.x.exe`)*
-2. Run the installer and install to the default path:  
-   `C:\Program Files\Tesseract-OCR`
-3. Add `C:\Program Files\Tesseract-OCR` to your System `PATH` environment variable.
-4. Restart your terminal or command prompt.
-
-> **Note on App Behavior**: If Tesseract is not installed, the application **will not crash**. It displays a clear, helpful status indicator in the sidebar and an informational alert when scanned images are uploaded, explaining that digital PDF extraction remains fully operational.
-
----
-
-## Testing & Sample Verification
-
-The repository includes three verified sample documents in the `samples/` directory:
-
-| Filename | Expected Type | Detected Type | Fields Found | Fields Not Found |
-| :--- | :--- | :--- | :--- | :--- |
-| **`samples/invoice_1.pdf`** | `Invoice` | `Invoice` | **Invoice Number**: `INV-2026-001`<br>**Date**: `15/03/2026`<br>**Company Name**: `TechCorp Solutions Inc.`<br>**Total Amount**: `$ 1,450.00` | *None (All 4 found)* |
-| **`samples/invoice_2.pdf`** | `Invoice` | `Invoice` | **Invoice Number**: `INV-8832`<br>**Date**: `2026-04-10`<br>**Company Name**: `Apex Retailers Pvt Ltd`<br>**Total Amount**: `Rs. 78,500` | *None (All 4 found)* |
-| **`samples/resume_1.pdf`** | `Resume` | `Resume` | **Candidate Name**: `Alex Smith`<br>**Email**: `alex.smith@email.com`<br>**Phone**: `+91 98765 43210`<br>**Skills**: `Python, SQL, JavaScript, C++, Streamlit, PyMuPDF, Scikit-learn, PyTorch, Docker, FastAPI, Pandas, Git` | *None (All 4 found)* |
-
-You can test these files in 1 click using the **Quick Test Samples** selector in the Streamlit sidebar!
+1. **Load Pre-built Samples**: Use the sidebar **"Quick Load Sample Document"** selector to test `sample_invoice.pdf`, `sample_resume.pdf`, or `sample_contract.pdf`.
+2. **Review the 6 Pipeline Stages**: Verify that each stage dynamically executes and checks off:
+   - `✓ Document Uploaded`
+   - `✓ Text Extracted`
+   - `✓ Text Cleaned`
+   - `✓ Document Classified`
+   - `✓ Fields Extracted`
+   - `✓ Missing Fields Checked`
+3. **Compare Models Live**: Switch the model selector between **Logistic Regression**, **Linear SVM**, **Naive Bayes**, and **Rule-Based Baseline** to view classification predictions in real time.
+4. **Inspect Text Cleaning**: Open the **"Text Cleaning & Preprocessing"** tab to compare `Original Extracted Text` against `Normalized Clean Text`.
+5. **Inspect Missing Field Truthfulness**: Review the extracted entities table. Any field not present in the document cleanly displays `"Not Found"` in muted styling rather than hallucinated estimates.
+6. **Export Output**: Download the extracted structured records in structured JSON or CSV format with one click.
 
 ---
 
-## Screenshots
+## 🌐 Cloud Deployment (Streamlit Community Cloud)
 
-Demo screenshots can be viewed or captured into the `screenshots/` directory:
-
-| Screen | Description | File Location |
-| :--- | :--- | :--- |
-| **1. Upload Screen** | Main interface with sidebar system status indicators and drag-and-drop uploader. | `screenshots/01_upload_screen.png` |
-| **2. Invoice Result** | Analysis cards showing Invoice Number, Date, Company, and Total Amount. | `screenshots/02_invoice_result.png` |
-| **3. Resume Result** | Analysis cards showing Candidate Name, Email, Phone, and Skills badges. | `screenshots/03_resume_result.png` |
-| **4. Extracted Text** | Expandable text view with character/word counts and JSON/TXT download options. | `screenshots/04_extracted_text.png` |
+1. Fork or push this repository to your GitHub account.
+2. Navigate to [share.streamlit.io](https://share.streamlit.io).
+3. Connect your GitHub account and select repository: `ai-document-intelligence`.
+4. Set Main file path to `app.py`.
+5. Click **Deploy**.
 
 ---
 
-## Limitations
+## 📄 License
 
-- **Rule-Based Classification**: Classification relies on domain keyword density. Highly unconventional documents with mixed terminology may be categorized as `Other`.
-- **Pattern-Based Field Extraction**: Field extraction uses flexible regular expressions and layout heuristics. Non-standard date formats or heavily skewed tables may require custom regex patterns.
-- **OCR System Dependency**: OCR requires the Tesseract binary to be installed on the host operating system.
-- **Complex Multi-Column Layouts**: PyMuPDF extracts text in reading order; complex multi-column layouts without clear line breaks can occasionally interleave text.
-
----
-
-## Future Improvements
-
-- **Layout-Aware AI Models**: Integrate LayoutLM or Donut for vision-and-layout-based document understanding.
-- **Expanded Document Classes**: Add support for Medical Prescriptions, Contracts, Bank Statements, and ID Cards.
-- **Table Structure Extraction**: Implement Camelot / pdfplumber for tabular line-item extraction.
-- **RESTful API Endpoint**: Add a FastAPI microservice alongside the Streamlit UI for enterprise system integration.
-- **Persistent Database Storage**: Store processed document metadata and audit trails in PostgreSQL or SQLite.
-
----
-
-## Deployment (Streamlit Community Cloud)
-
-To deploy this application to Streamlit Community Cloud:
-
-1. Push your repository to GitHub (ensure `app.py` and `requirements.txt` are at the repository root).
-2. Go to **[share.streamlit.io](https://share.streamlit.io)** and log in with GitHub.
-3. Click **New app**, select repository `ai-document-intelligence`, branch `main`, and main file path `app.py`.
-4. (Optional for OCR) Add a `packages.txt` file containing `tesseract-ocr` if you want Tesseract OCR enabled on the cloud Linux container.
-5. Click **Deploy!**
-
----
-
-## GitHub Setup Commands
-
-Use these exact commands to initialize and push your project to GitHub:
-
-```bash
-# 1. Initialize Git repository
-git init
-
-# 2. Stage all files
-git add .
-
-# 3. Commit your changes
-git commit -m "Build AI Document Intelligence MVP"
-
-# 4. Set main branch
-git branch -M main
-
-# 5. Add remote GitHub repository (replace with your repo URL)
-git remote add origin https://github.com/<YOUR_USERNAME>/ai-document-intelligence.git
-
-# 6. Push to GitHub
-git push -u origin main
-```
-
----
-
-## Evaluation & Demonstration Guide
-
-When presenting or demonstrating this project:
-1. **Explain the Architecture**: Highlight the separation between file ingestion, extraction (PyMuPDF with OCR fallback), classification, and field parsing.
-2. **Demonstrate Both Invoice & Resume**: Use the sidebar sample loader to demonstrate `invoice_1.pdf`, `invoice_2.pdf`, and `resume_1.pdf` live.
-3. **Showcase Truthfulness**: Point out that when a field cannot be matched with confidence, it cleanly outputs `"Not found"` rather than hallucinating fake data.
-4. **Highlight Resilience**: Demonstrate error handling by attempting to upload a text file or image when OCR is unavailable—showing that the app never crashes.
-5. **Discuss Rule-based vs. ML**: Explain why rule-based extraction was prioritized for high transparency and speed, and showcase the optional TF-IDF ML toggle.
+This project is licensed under the [MIT License](LICENSE).

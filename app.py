@@ -1,569 +1,210 @@
 """
-AI Document Intelligence MVP
-Document Analysis & Information Extraction MVP
-
-An end-to-end document processing application built with Streamlit, PyMuPDF,
-Pillow, pytesseract, and regular expressions. It ingests PDFs and images,
-extracts text with OCR fallback, classifies documents as Invoice, Resume, or Other,
-and extracts domain-specific structured fields.
+AI Document Intelligence & Workflow Platform
+Week 3: Improved Document Understanding
+Understand. Classify. Extract.
 """
 
 import os
 import io
-import re
-import json
-import shutil
-from typing import Tuple, Dict, Any, Optional
+import time
+from typing import Dict, Any, Optional
 
 import streamlit as st
-import pymupdf
+import pandas as pd
+import numpy as np
 from PIL import Image
-import pytesseract
 
-# Optional Machine Learning Classifier imports
-try:
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.linear_model import LogisticRegression
-    SKLEARN_AVAILABLE = True
-except ImportError:
-    SKLEARN_AVAILABLE = False
+# Import Modular Core
+from src.document_reader import DocumentReader
+from src.ocr_processor import OCRProcessor
+from src.text_cleaner import TextCleaner
+from src.classifier import DocumentClassifier
+from src.extractor import DocumentExtractor, NOT_FOUND
+from src.evaluator import ModelEvaluator
+from src.utils import (
+    load_dataset_from_dir,
+    export_result_to_json,
+    export_result_to_csv,
+    generate_rich_sample_pdfs
+)
 
-
-# =====================================================================
-# SYSTEM CONFIGURATION & TESSERACT OCR DISCOVERY
-# =====================================================================
-
-def configure_tesseract() -> bool:
-    """
-    Checks if Tesseract OCR is available on the host machine.
-    Checks standard Windows installation paths if not on system PATH.
-    Returns True if Tesseract is detected and configured, False otherwise.
-    """
-    # 1. Check if already in PATH
-    if shutil.which("tesseract"):
-        return True
-
-    # 2. Check standard Windows default paths
-    windows_paths = [
-        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe"),
-    ]
-
-    for path in windows_paths:
-        if os.path.isfile(path):
-            pytesseract.pytesseract.tesseract_cmd = path
-            return True
-
-    return False
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(BASE_DIR, "models")
+MODEL_PATH = os.path.join(MODELS_DIR, "classifier.pkl")
+DATA_DIR = os.path.join(BASE_DIR, "data")
+SAMPLES_DIR = os.path.join(BASE_DIR, "samples")
 
 
-TESSERACT_AVAILABLE = configure_tesseract()
+# =============================================================================
+# INITIALIZATION & MODEL CACHING
+# =============================================================================
 
+@st.cache_resource(show_spinner=False)
+def initialize_system():
+    """Initializes sample files, loads training dataset, and prepares classifiers."""
+    generate_rich_sample_pdfs(SAMPLES_DIR)
 
-# =====================================================================
-# 1. TEXT EXTRACTION ENGINES (PyMuPDF & OCR FALLBACK)
-# =====================================================================
+    clf = DocumentClassifier()
+    model_loaded = clf.load_model(MODEL_PATH)
 
-def extract_text_from_pdf(pdf_bytes: bytes) -> Tuple[str, bool, str]:
-    """
-    Extracts text from an uploaded PDF file using PyMuPDF.
-    If selectable text is missing or negligible (scanned document),
-    automatically triggers OCR fallback using PyMuPDF page rendering and pytesseract.
+    train_dir = os.path.join(DATA_DIR, "train")
+    test_dir = os.path.join(DATA_DIR, "test")
 
-    Returns:
-        (extracted_text, used_ocr, status_message)
-    """
-    try:
-        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-    except Exception as e:
-        return "", False, f"Failed to open PDF document: {str(e)}"
+    train_texts, train_labels = load_dataset_from_dir(train_dir)
+    test_texts, test_labels = load_dataset_from_dir(test_dir)
 
-    if doc.page_count == 0:
-        return "", False, "The uploaded PDF document contains no pages."
-
-    page_texts = []
-    for page_num in range(doc.page_count):
+    if not model_loaded and train_texts:
+        clf.train(train_texts, train_labels)
         try:
-            page = doc.load_page(page_num)
-            text = page.get_text("text")
-            if text:
-                page_texts.append(text.strip())
+            clf.save_model(MODEL_PATH)
         except Exception:
-            continue
+            pass
 
-    combined_text = "\n\n".join(page_texts).strip()
+    # Compute evaluation metrics across test set
+    eval_results = None
+    if test_texts and test_labels and clf.is_trained:
+        eval_results = ModelEvaluator.evaluate_all_models(clf, test_texts, test_labels)
 
-    # If selectable text is sufficient (at least 20 alphanumeric characters)
-    alphanumeric_count = len(re.findall(r"\w", combined_text))
-    if alphanumeric_count >= 20:
-        doc.close()
-        return combined_text, False, "Text extraction successful (Native PDF selectable text)"
-
-    # Fallback to OCR if selectable text is insufficient
-    ocr_text, ocr_success, ocr_msg = ocr_pdf(doc)
-    doc.close()
-
-    if ocr_success and len(re.findall(r"\w", ocr_text)) > 0:
-        return ocr_text, True, "No selectable text detected — successfully extracted using OCR fallback."
-    elif not TESSERACT_AVAILABLE:
-        return (
-            combined_text,
-            False,
-            "No selectable text detected. OCR fallback is unavailable because Tesseract OCR is not installed or configured."
-        )
-    else:
-        return ocr_text, True, f"OCR completed with message: {ocr_msg}"
+    ocr_engine = OCRProcessor()
+    return clf, ocr_engine, eval_results
 
 
-def ocr_pdf(doc: pymupdf.Document) -> Tuple[str, bool, str]:
+# =============================================================================
+# PIPELINE CONTROLLER
+# =============================================================================
+
+def process_document(
+    file_bytes: bytes,
+    filename: str,
+    file_extension: str,
+    classifier: DocumentClassifier,
+    ocr_engine: OCRProcessor,
+    active_model_name: str,
+    ocr_settings: Dict[str, bool]
+) -> Dict[str, Any]:
     """
-    Renders PDF pages to high-resolution images and extracts text via pytesseract.
-    """
-    if not TESSERACT_AVAILABLE:
-        return "", False, "Tesseract OCR executable not found on host."
-
-    extracted_pages = []
-    try:
-        for page_num in range(min(doc.page_count, 10)):  # Safeguard: first 10 pages
-            page = doc.load_page(page_num)
-            pix = page.get_pixmap(dpi=200)
-            img = Image.open(io.BytesIO(pix.tobytes("png")))
-            page_text = pytesseract.image_to_string(img)
-            if page_text.strip():
-                extracted_pages.append(page_text.strip())
-
-        full_text = "\n\n".join(extracted_pages).strip()
-        return full_text, True, "OCR extraction completed successfully."
-    except Exception as e:
-        return "", False, f"Error occurred during PDF OCR: {str(e)}"
-
-
-def extract_text_from_image(image_bytes: bytes) -> Tuple[str, bool, str]:
-    """
-    Extracts text from an image (JPG, JPEG, PNG) using Pillow and pytesseract.
-    """
-    if not TESSERACT_AVAILABLE:
-        return (
-            "",
-            False,
-            "Tesseract OCR is not installed or configured. Please install Tesseract to extract text from images."
-        )
-
-    try:
-        img = Image.open(io.BytesIO(image_bytes))
-        # Basic preprocessing: convert palette or RGBA to RGB
-        if img.mode in ("RGBA", "P"):
-            img = img.convert("RGB")
-
-        text = pytesseract.image_to_string(img)
-        cleaned_text = text.strip()
-
-        if not cleaned_text:
-            return "", True, "OCR completed, but no legible text was detected in the image."
-
-        return cleaned_text, True, "Text extracted successfully using Tesseract OCR."
-    except Exception as e:
-        return "", False, f"Image processing error: {str(e)}"
-
-
-# =====================================================================
-# 2. DOCUMENT CLASSIFICATION (RULE-BASED & OPTIONAL ML)
-# =====================================================================
-
-INVOICE_KEYWORDS = [
-    "invoice", "invoice number", "invoice no", "inv-", "inv #", "inv no",
-    "bill to", "billed to", "tax invoice", "amount due", "balance due",
-    "total amount", "subtotal", "gstin", "payment terms", "due date",
-    "item particulars", "description", "qty", "quantity", "unit price"
-]
-
-RESUME_KEYWORDS = [
-    "resume", "curriculum vitae", "cv", "experience", "work experience",
-    "education", "skills", "technical expertise", "projects", "summary",
-    "professional summary", "employment", "certifications", "bachelor",
-    "master", "university", "github", "linkedin", "competencies"
-]
-
-
-def classify_rule_based(text: str) -> Tuple[str, str, Dict[str, Any]]:
-    """
-    Classifies the document as 'Invoice', 'Resume', or 'Other' based on keyword occurrence counts.
-    Returns: (document_type, method_name, details_dict)
-    """
-    lower_text = text.lower()
-
-    # Compute matches for invoices
-    invoice_score = 0
-    matched_invoice_kws = []
-    for kw in INVOICE_KEYWORDS:
-        count = lower_text.count(kw)
-        if count > 0:
-            invoice_score += count
-            matched_invoice_kws.append(f"{kw} ({count})")
-
-    # Compute matches for resumes
-    resume_score = 0
-    matched_resume_kws = []
-    for kw in RESUME_KEYWORDS:
-        count = lower_text.count(kw)
-        if count > 0:
-            resume_score += count
-            matched_resume_kws.append(f"{kw} ({count})")
-
-    # Classification decision
-    if invoice_score > resume_score and invoice_score >= 2:
-        doc_type = "Invoice"
-    elif resume_score > invoice_score and resume_score >= 2:
-        doc_type = "Resume"
-    else:
-        doc_type = "Other"
-
-    details = {
-        "invoice_score": invoice_score,
-        "resume_score": resume_score,
-        "matched_invoice_keywords": matched_invoice_kws[:6],
-        "matched_resume_keywords": matched_resume_kws[:6],
-    }
-
-    return doc_type, "Rule-based classification", details
-
-
-# Optional ML Enhancement (TF-IDF + Logistic Regression)
-@st.cache_resource
-def train_optional_ml_classifier():
-    """
-    Trains a lightweight in-memory TF-IDF + Logistic Regression classifier
-    on representative sample texts as an optional enhancement.
-    """
-    if not SKLEARN_AVAILABLE:
-        return None, None
-
-    training_docs = [
-        # Invoices
-        "Tax Invoice Invoice No: INV-1002 Date: 2026-01-10 Bill To Acme Corp Total Amount: $450.00 Subtotal Payment Terms Due Date",
-        "INVOICE TechCorp Solutions Invoice Number: INV-9921 Total Amount Due: $1,250.00 Description Qty Unit Price",
-        "Commercial Invoice Bill To Client Ltd Amount Due: ₹45,000 GSTIN Tax Description Total Hours Rate",
-        "Invoice receipt for hardware items item particulars qty balance due total: $890.00",
-        "Tax invoice Apex Retailers Private Limited Billed to Sharma Electronics Total Amount: ₹78,500",
-
-        # Resumes
-        "Alex Smith Software Engineer Resume Email: alex@test.com Phone: 9876543210 Skills: Python Streamlit PyTorch Experience Education",
-        "Curriculum Vitae John Doe Data Scientist Technical Expertise: Machine Learning SQL Docker Work Experience Projects",
-        "Jane Developer Professional Summary 4 years experience in Full Stack Development Education Bachelor of Technology Skills Java React",
-        "Resume Jane Smith AI Engineer Employment History Nexa Systems GitHub LinkedIn Education Master of Science",
-        "Curriculum Vitae Alex Smith Skills & Technical Expertise: Python PyMuPDF Scikit-learn FastAPI Education VTU",
-
-        # Other
-        "Meeting Minutes Project update discussion regarding Q3 roadmap. Attendees agreed to review timelines next week.",
-        "Terms and Conditions Agreement. This agreement is entered between party A and party B for general service guidelines.",
-        "A brief overview of renewable energy systems and recent solar cell efficiencies published in scientific journals.",
-        "Company picnic notice. All employees are invited to attend the annual gathering this Saturday at Central Park."
-    ]
-
-    training_labels = [
-        "Invoice", "Invoice", "Invoice", "Invoice", "Invoice",
-        "Resume", "Resume", "Resume", "Resume", "Resume",
-        "Other", "Other", "Other", "Other"
-    ]
-
-    vectorizer = TfidfVectorizer(ngram_range=(1, 2), stop_words="english")
-    X = vectorizer.fit_transform(training_docs)
-    clf = LogisticRegression(random_state=42)
-    clf.fit(X, training_labels)
-
-    return vectorizer, clf
-
-
-def classify_with_ml(text: str) -> Tuple[str, str, Dict[str, Any]]:
-    """
-    Classifies document using the optional TF-IDF + Logistic Regression model.
-    Falls back to rule-based if scikit-learn is unavailable.
-    """
-    vectorizer, clf = train_optional_ml_classifier()
-    if vectorizer is None or clf is None:
-        return classify_rule_based(text)
-
-    X_test = vectorizer.transform([text])
-    predicted_type = clf.predict(X_test)[0]
-    probabilities = clf.predict_proba(X_test)[0]
-    classes = clf.classes_
-
-    prob_dict = {cls: round(float(prob), 3) for cls, prob in zip(classes, probabilities)}
-
-    return predicted_type, "TF-IDF + Logistic Regression (Optional ML)", prob_dict
-
-
-# =====================================================================
-# 3. FIELD EXTRACTION ENGINES
-# =====================================================================
-
-def extract_invoice_fields(text: str) -> Dict[str, str]:
-    """
-    Extracts key fields for invoices using regex and heuristic rules:
-    - Invoice Number
-    - Date
-    - Company Name
-    - Total Amount
-    """
-    fields = {
-        "Invoice Number": "Not found",
-        "Date": "Not found",
-        "Company Name": "Not found",
-        "Total Amount": "Not found"
-    }
-
-    # 1. Invoice Number Extraction
-    inv_num_patterns = [
-        r"(?i)\b(?:invoice\s*(?:no\.?|number|#|id)|inv\s*(?:no\.?|number|#)|bill\s*(?:no\.?|number|#))\s*[:#\-]?\s*([A-Za-z0-9\-_/]+)",
-        r"(?i)\binvoice\s*[:#]\s*([A-Za-z0-9\-_/]+)",
-        r"(?i)\b(INV-[A-Za-z0-9\-_/]+)\b",
-    ]
-    for pattern in inv_num_patterns:
-        match = re.search(pattern, text)
-        if match:
-            candidate = match.group(1).strip().strip(":,")
-            if len(candidate) >= 3 and candidate.lower() not in ["invoice", "tax", "date", "bill", "due"]:
-                fields["Invoice Number"] = candidate
-                break
-
-    # 2. Date Extraction
-    date_patterns = [
-        r"(?i)\b(?:date|invoice\s*date|dated|issue\s*date)\s*[:#\-]?\s*([0-9]{1,4}[-/.][0-9]{1,2}[-/.][0-9]{1,4})",
-        r"(?i)\b(?:date|invoice\s*date|dated)\s*[:#\-]?\s*([A-Za-z]{3,9}\s+[0-9]{1,2},?\s+[0-9]{4})",
-        r"(?i)\b(?:date|invoice\s*date|dated)\s*[:#\-]?\s*([0-9]{1,2}\s+[A-Za-z]{3,9},?\s+[0-9]{4})",
-        r"\b([0-9]{4}[-/][0-9]{1,2}[-/][0-9]{1,2})\b",
-        r"\b([0-9]{1,2}[-/][0-9]{1,2}[-/][0-9]{2,4})\b"
-    ]
-    for pattern in date_patterns:
-        match = re.search(pattern, text)
-        if match:
-            candidate = match.group(1).strip()
-            if any(c.isdigit() for c in candidate):
-                fields["Date"] = candidate
-                break
-
-    # 3. Company Name Extraction (Heuristic inspection of top lines)
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    stop_terms = ["invoice", "tax invoice", "commercial invoice", "bill to", "billed to", "date", "due date", "page", "phone", "email", "gstin"]
-
-    company_candidate = None
-    for line in lines[:8]:  # inspect first 8 lines
-        lower_line = line.lower()
-        if any(lower_line.startswith(term) for term in stop_terms):
-            continue
-
-        corp_indicators = ["inc", "ltd", "pvt", "corp", "corporation", "solutions", "retailers", "technologies", "systems", "services", "company", "enterprises"]
-        if any(re.search(rf"\b{ind}\b", lower_line) for ind in corp_indicators):
-            company_candidate = line
-            break
-
-    if not company_candidate and lines:
-        for line in lines[:5]:
-            if line.lower() not in ["invoice", "tax invoice", "commercial invoice"] and len(line) > 3:
-                company_candidate = line
-                break
-
-    if company_candidate:
-        fields["Company Name"] = company_candidate.strip()
-
-    # 4. Total Amount Extraction
-    amount_patterns = [
-        r"(?i)(?:total\s*amount|grand\s*total|amount\s*due|balance\s*due|total)\s*[:#\-]?\s*([₹$€£]|USD|INR|Rs\.?)?\s*([0-9,]+(?:\.[0-9]{2})?)",
-        r"(?i)([₹$€£]|USD|INR|Rs\.?)\s*([0-9,]+(?:\.[0-9]{2})?)",
-        r"(?i)(?:total|due)\s*[:#\-]?\s*([0-9,]+(?:\.[0-9]{2})?)"
-    ]
-    for pattern in amount_patterns:
-        matches = re.findall(pattern, text)
-        if matches:
-            for m in reversed(matches):
-                if isinstance(m, tuple):
-                    curr = m[0].strip() if len(m) > 1 and m[0] else ""
-                    val = m[1].strip() if len(m) > 1 else m[0].strip()
-                else:
-                    curr = ""
-                    val = m.strip()
-
-                if val and any(c.isdigit() for c in val):
-                    fields["Total Amount"] = f"{curr} {val}".strip() if curr else val
-                    break
-            if fields["Total Amount"] != "Not found":
-                break
-
-    return fields
-
-
-def extract_resume_fields(text: str) -> Dict[str, str]:
-    """
-    Extracts key fields for resumes using regex and heuristic rules:
-    - Name
-    - Email
-    - Phone
-    - Skills
-    """
-    fields = {
-        "Name": "Not found",
-        "Email": "Not found",
-        "Phone": "Not found",
-        "Skills": "Not found"
-    }
-
-    # 1. Email Extraction
-    email_pattern = r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
-    email_match = re.search(email_pattern, text)
-    if email_match:
-        fields["Email"] = email_match.group(0).strip()
-
-    # 2. Phone Extraction (Supports Indian, international, and US formats)
-    phone_pattern = r"(?:(?:\+|00)\d{1,3}[\s-]?)?(?:\(?\d{2,5}\)?[\s-]?)?\d{3,5}[\s-]?\d{3,5}"
-    phone_matches = re.findall(phone_pattern, text)
-    for p in phone_matches:
-        digits = re.sub(r"\D", "", p)
-        if 10 <= len(digits) <= 14:
-            fields["Phone"] = p.strip()
-            break
-
-    # 3. Name Extraction (Heuristic based on candidate header lines)
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    invalid_name_terms = [
-        "resume", "curriculum", "vitae", "cv", "email", "phone", "profile",
-        "summary", "experience", "education", "skills", "page", "http", "www", "github", "linkedin"
-    ]
-
-    for line in lines[:5]:
-        lower_line = line.lower()
-        if any(term in lower_line for term in invalid_name_terms):
-            continue
-        if "@" in line or any(c.isdigit() for c in line):
-            continue
-
-        words = line.split()
-        if 1 <= len(words) <= 4:
-            fields["Name"] = line.strip()
-            break
-
-    # 4. Skills Extraction
-    # Strategy A: Look for a dedicated Skills block/section
-    skills_pattern = r"(?i)(?:skills\s*(?:&|and)?\s*technical\s*expertise|technical\s*skills|core\s*competencies|skills)\s*[:\-\n]([\s\S]*?)(?=\n\s*(?:work\s*experience|experience|education|projects|certifications|employment)|$)"
-    skills_match = re.search(skills_pattern, text)
-
-    extracted_skills = []
-    if skills_match:
-        skills_block = skills_match.group(1).strip()
-        # Clean lines and split on commas or bullets
-        raw_skills = re.split(r"[,•|\n;]", skills_block)
-        for s in raw_skills:
-            clean_s = re.sub(r"^(?:languages|frameworks\s*&\s*tools|frameworks|tools|technologies|competencies|core\s*competencies)\s*[:\-]", "", s, flags=re.IGNORECASE).strip()
-            if clean_s and len(clean_s) <= 40 and not any(clean_s.lower().startswith(b) for b in ["experience", "education"]):
-                extracted_skills.append(clean_s)
-
-    # Strategy B: Fallback keyword dictionary matching if section parse is sparse
-    common_skills = [
-        "Python", "SQL", "Java", "C++", "JavaScript", "TypeScript", "HTML", "CSS",
-        "Streamlit", "PyMuPDF", "FastAPI", "Flask", "Django", "Docker", "Kubernetes",
-        "Machine Learning", "Deep Learning", "NLP", "Computer Vision", "PyTorch",
-        "TensorFlow", "Scikit-learn", "Pandas", "NumPy", "Git", "PostgreSQL", "MongoDB",
-        "AWS", "Azure", "GCP", "Linux", "REST APIs", "CI/CD"
-    ]
-
-    if not extracted_skills or len(extracted_skills) < 2:
-        for skill in common_skills:
-            if re.search(rf"\b{re.escape(skill)}\b", text, re.IGNORECASE):
-                if skill not in extracted_skills:
-                    extracted_skills.append(skill)
-
-    if extracted_skills:
-        # Deduplicate while preserving order
-        unique_skills = []
-        for s in extracted_skills:
-            if s and s not in unique_skills:
-                unique_skills.append(s)
-        fields["Skills"] = ", ".join(unique_skills[:12])
-
-    return fields
-
-
-# =====================================================================
-# 4. PIPELINE CONTROLLER & DATA MODEL
-# =====================================================================
-
-def process_document(file_bytes: bytes, filename: str, file_extension: str, classification_mode: str = "Rule-based") -> Dict[str, Any]:
-    """
-    Coordinates file validation, text extraction, document classification,
-    and field extraction into a standardized result dictionary.
+    Executes the 6-stage end-to-end processing pipeline:
+    1. Validate
+    2. Extract Text / OCR
+    3. Clean Text
+    4. Classify Type
+    5. Extract Fields
+    6. Check Missing Fields
     """
     ext = file_extension.lower()
+    stages = []
 
-    # 1. Text Extraction
+    # Stage 1: Document Uploaded & Validated
+    stages.append("Document Uploaded")
+
+    # Stage 2: Text Extraction / OCR
+    raw_text = ""
+    ocr_used = False
+    ocr_steps = []
+    extraction_note = ""
+
     if ext == "pdf":
-        text, used_ocr, status_msg = extract_text_from_pdf(file_bytes)
+        read_res = DocumentReader.read_pdf(file_bytes)
+        if read_res["error"]:
+            return {"error": read_res["error"], "stages": stages}
+
+        if read_res["needs_ocr"]:
+            ocr_res = ocr_engine.ocr_pdf(
+                file_bytes,
+                preprocess=ocr_settings.get("preprocess", True)
+            )
+            raw_text = ocr_res["text"]
+            ocr_used = True
+            ocr_steps = ocr_res.get("preprocessing_steps", [])
+            extraction_note = "Scanned PDF detected — executed OCR fallback."
+        else:
+            raw_text = read_res["text"]
+            extraction_note = f"Direct PyMuPDF selectable text extracted ({read_res['page_count']} page(s))."
     elif ext in ("jpg", "jpeg", "png"):
-        text, used_ocr, status_msg = extract_text_from_image(file_bytes)
+        ocr_res = ocr_engine.extract_from_image(
+            file_bytes,
+            preprocess=ocr_settings.get("preprocess", True)
+        )
+        raw_text = ocr_res["text"]
+        ocr_used = True
+        ocr_steps = ocr_res.get("preprocessing_steps", [])
+        extraction_note = "Image upload processed via OCR engine."
     else:
         return {
-            "filename": filename,
-            "file_type": ext,
-            "document_type": "Unsupported",
-            "classification_method": "None",
-            "fields": {},
-            "text": "",
-            "error": "Unsupported file format. Please upload a PDF, JPG, JPEG, or PNG."
+            "error": "Unsupported file format. Please upload a PDF, JPG, JPEG, or PNG.",
+            "stages": stages
         }
 
-    # 2. Document Classification
-    if not text.strip():
+    stages.append("Text Extracted")
+
+    # Stage 3: Text Cleaning & Normalization
+    clean_res = TextCleaner.clean(raw_text)
+    cleaned_text = clean_res["cleaned_text"]
+    stages.append("Text Cleaned")
+
+    if not clean_res["is_valid"]:
         return {
             "filename": filename,
-            "file_type": ext,
-            "document_type": "Other",
-            "classification_method": "None (Empty Text)",
-            "classification_details": {},
+            "file_type": ext.upper(),
+            "document_type": "Unreadable",
+            "confidence": "Not Available",
+            "classification_model": active_model_name,
             "fields": {},
-            "text": "",
-            "ocr_used": used_ocr,
-            "status_message": status_msg,
-            "error": "No text could be extracted from this document."
+            "missing_fields": [],
+            "original_text": raw_text,
+            "cleaned_text": cleaned_text,
+            "ocr_used": ocr_used,
+            "ocr_steps": ocr_steps,
+            "extraction_note": extraction_note,
+            "stages": stages,
+            "error": clean_res.get("warning") or "Unable to extract readable text from this document. Please upload a clearer document."
         }
 
-    if classification_mode == "Optional ML (TF-IDF)" and SKLEARN_AVAILABLE:
-        doc_type, method_name, details = classify_with_ml(text)
-    else:
-        doc_type, method_name, details = classify_rule_based(text)
+    # Stage 4: Document Classification
+    pred_res = classifier.predict(cleaned_text, model_name=active_model_name)
+    doc_type = pred_res["document_type"]
+    confidence = pred_res["confidence"]
+    stages.append("Document Classified")
 
-    # 3. Field Extraction based on Identified Type
-    if doc_type == "Invoice":
-        fields = extract_invoice_fields(text)
-    elif doc_type == "Resume":
-        fields = extract_resume_fields(text)
-    else:
-        fields = {
-            "Notice": "Document classified as 'Other'. Field extraction is tailored for Invoices and Resumes."
-        }
+    # Stage 5 & 6: Information Extraction & Missing Fields Detection
+    extract_res = DocumentExtractor.extract(cleaned_text, doc_type)
+    fields = extract_res["fields"]
+    missing_fields = extract_res["missing_fields"]
+    stages.append("Fields Extracted")
+    stages.append("Missing Fields Checked")
 
-    # 4. Return Normalized Data Model
     return {
         "filename": filename,
         "file_type": ext.upper(),
         "document_type": doc_type,
-        "classification_method": method_name,
-        "classification_details": details,
+        "confidence": confidence,
+        "classification_model": active_model_name,
+        "probabilities": pred_res.get("probabilities"),
         "fields": fields,
-        "text": text,
-        "text_length": len(text),
-        "word_count": len(text.split()),
-        "ocr_used": used_ocr,
-        "status_message": status_msg,
+        "missing_fields": missing_fields,
+        "fields_found_count": extract_res.get("fields_found_count", 0),
+        "total_fields": extract_res.get("total_fields", 0),
+        "original_text": raw_text,
+        "cleaned_text": cleaned_text,
+        "char_count_original": clean_res["char_count_original"],
+        "char_count_cleaned": clean_res["char_count_cleaned"],
+        "reduction_pct": clean_res["reduction_pct"],
+        "word_count": len(cleaned_text.split()),
+        "ocr_used": ocr_used,
+        "ocr_steps": ocr_steps,
+        "extraction_note": extraction_note,
+        "stages": stages,
         "error": None
     }
 
 
-# =====================================================================
-# 5. STREAMLIT USER INTERFACE
-# =====================================================================
+# =============================================================================
+# STREAMLIT UI
+# =============================================================================
 
 def render_ui():
     st.set_page_config(
-        page_title="AI Document Intelligence",
+        page_title="AI Document Intelligence & Workflow Platform",
         page_icon="📄",
         layout="wide",
         initial_sidebar_state="expanded"
@@ -573,350 +214,439 @@ def render_ui():
     st.markdown("""
         <style>
         .main-header {
-            font-size: 2.3rem;
-            font-weight: 700;
-            color: #1E293B;
-            margin-bottom: 0.2rem;
+            font-size: 2.2rem;
+            font-weight: 800;
+            color: #0F172A;
+            margin-bottom: 0.1rem;
+            letter-spacing: -0.02em;
         }
         .sub-header {
             font-size: 1.05rem;
-            color: #64748B;
-            margin-bottom: 1.5rem;
+            color: #475569;
+            margin-bottom: 1.2rem;
         }
-        .badge-mvp {
+        .badge-tag {
             background-color: #EEF2FF;
-            color: #4F46E5;
-            padding: 0.25rem 0.6rem;
+            color: #4338CA;
+            padding: 0.25rem 0.65rem;
             border-radius: 9999px;
-            font-size: 0.8rem;
-            font-weight: 600;
+            font-size: 0.78rem;
+            font-weight: 700;
             display: inline-block;
             margin-bottom: 0.5rem;
         }
-        .metric-card {
-            background-color: #F8FAFC;
+        .stage-pill {
+            display: inline-flex;
+            align-items: center;
+            background-color: #ECFDF5;
+            color: #065F46;
+            border: 1px solid #A7F3D0;
+            padding: 0.28rem 0.65rem;
+            border-radius: 6px;
+            font-size: 0.82rem;
+            font-weight: 600;
+            margin-right: 0.45rem;
+            margin-bottom: 0.45rem;
+        }
+        .entity-card {
+            background-color: #FFFFFF;
             border: 1px solid #E2E8F0;
             border-radius: 8px;
-            padding: 1rem;
+            padding: 0.9rem 1.1rem;
             margin-bottom: 0.75rem;
+            box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
         }
-        .metric-label {
-            font-size: 0.8rem;
+        .entity-label {
+            font-size: 0.75rem;
             color: #64748B;
-            font-weight: 600;
+            font-weight: 700;
             text-transform: uppercase;
+            letter-spacing: 0.05em;
         }
-        .metric-value {
+        .entity-value {
             font-size: 1.15rem;
             color: #0F172A;
             font-weight: 600;
-            margin-top: 0.25rem;
+            margin-top: 0.2rem;
             word-break: break-word;
         }
-        .status-chip {
-            display: inline-block;
-            padding: 0.25rem 0.5rem;
+        .entity-missing {
+            color: #DC2626 !important;
+            font-style: italic;
+        }
+        .conf-badge {
+            background-color: #F1F5F9;
+            border: 1px solid #CBD5E1;
+            padding: 0.25rem 0.6rem;
             border-radius: 4px;
             font-size: 0.85rem;
-            font-weight: 500;
-            margin-right: 0.5rem;
-            margin-bottom: 0.5rem;
-        }
-        .status-success {
-            background-color: #DCFCE7;
-            color: #166534;
-        }
-        .status-info {
-            background-color: #E0F2FE;
-            color: #0369A1;
+            font-weight: 600;
         }
         </style>
     """, unsafe_allow_html=True)
 
-    # -------------------------------------------------------------
+    # Initialize Core Systems
+    clf, ocr_engine, eval_results = initialize_system()
+
+    # -------------------------------------------------------------------------
     # SIDEBAR
-    # -------------------------------------------------------------
+    # -------------------------------------------------------------------------
     with st.sidebar:
-        st.title("📄 AI Doc Intelligence")
-        st.caption("Document Analysis & Extraction MVP")
+        st.title("📄 Doc Intelligence")
+        st.caption("AI Document Understanding & Classification")
 
         st.markdown("---")
-        st.subheader("Application")
-        st.markdown("**Upload Document**")
-        st.markdown("Supported Formats: `PDF`, `JPG`, `JPEG`, `PNG`")
+        st.subheader("⚙️ Classification Model")
 
-        st.markdown("---")
-        st.subheader("System Status")
-
-        # Status 1: PDF Extraction
-        st.markdown("🔹 **PDF Extraction**: `PyMuPDF (Active)`")
-
-        # Status 2: OCR Engine
-        if TESSERACT_AVAILABLE:
-            st.markdown("🔹 **OCR Engine**: `Tesseract (Ready)`")
-        else:
-            st.markdown("🔸 **OCR Engine**: `Config Required`")
-            with st.expander("Install Tesseract on Windows"):
-                st.caption(
-                    "To enable OCR for scanned images:\n"
-                    "1. Download installer from GitHub: `UB-Mannheim/tesseract/wiki`\n"
-                    "2. Install to default path (`C:\\Program Files\\Tesseract-OCR`)\n"
-                    "3. Restart the Streamlit app."
-                )
-
-        # Status 3: Document Classification
-        st.markdown("🔹 **Classification**: `Keyword Rule-Based`")
-
-        # Status 4: Field Extraction
-        st.markdown("🔹 **Field Extraction**: `Active (Regex Rules)`")
-
-        st.markdown("---")
-        st.subheader("Classification Settings")
-        classifier_mode = st.radio(
-            "Classification Engine:",
-            options=["Rule-based", "Optional ML (TF-IDF)"],
+        model_options = [
+            "Logistic Regression",
+            "Linear SVM",
+            "Naive Bayes",
+            "Rule-Based Baseline"
+        ]
+        selected_model = st.selectbox(
+            "Active Classifier:",
+            model_options,
             index=0,
-            help="Rule-based is transparent and fast. Optional ML uses a lightweight TF-IDF + Logistic Regression model."
+            help="Choose the model used to classify documents. Logistic Regression & Naive Bayes provide calibrated probabilistic confidence."
         )
 
         st.markdown("---")
-        st.subheader("Quick Test Samples")
-        st.caption("Load an included test document instantly:")
+        st.subheader("🔍 OCR & Preprocessing")
+        if ocr_engine.tesseract_available:
+            st.success("Tesseract OCR: Active")
+        else:
+            st.info("PyMuPDF Direct Extraction: Active (OCR available when Tesseract is installed)")
 
-        samples_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "samples")
-        sample_options = ["None (Upload my own)"]
-        sample_files = ["invoice_1.pdf", "invoice_2.pdf", "resume_1.pdf"]
+        with st.expander("Image Preprocessing Options", expanded=False):
+            apply_preprocess = st.checkbox("Enable Image Preprocessing", value=True)
+            apply_grayscale = st.checkbox("Grayscale Conversion", value=True, disabled=not apply_preprocess)
+            apply_threshold = st.checkbox("Contrast Thresholding", value=True, disabled=not apply_preprocess)
+            apply_denoise = st.checkbox("Noise Reduction Filter", value=True, disabled=not apply_preprocess)
 
-        for sf in sample_files:
-            if os.path.isfile(os.path.join(samples_dir, sf)):
-                sample_options.append(sf)
+        ocr_settings = {
+            "preprocess": apply_preprocess,
+            "grayscale": apply_grayscale,
+            "threshold": apply_threshold,
+            "denoise": apply_denoise
+        }
 
-        selected_sample = st.selectbox("Select sample file:", sample_options)
+        st.markdown("---")
+        st.subheader("📁 Test Samples Showcase")
+        st.caption("Load a verified test sample directly:")
 
-    # -------------------------------------------------------------
+        sample_choices = [
+            "None (Upload my own file)",
+            "invoice_1.pdf (Consulting Invoice - $ 1,450.00)",
+            "invoice_2.pdf (Tax Invoice - Rs. 78,500)",
+            "invoice_missing_total.pdf (Invoice with Missing Total)",
+            "resume_1.pdf (Software Engineer Resume)",
+            "resume_missing_phone.pdf (Resume with Missing Phone)",
+            "meeting_minutes.pdf (Other - Strategy Memo)"
+        ]
+        selected_sample_label = st.selectbox("Choose sample:", sample_choices)
+
+    # -------------------------------------------------------------------------
     # HEADER
-    # -------------------------------------------------------------
-    st.markdown('<span class="badge-mvp">DOCUMENT ANALYSIS MVP</span>', unsafe_allow_html=True)
+    # -------------------------------------------------------------------------
+    st.markdown('<span class="badge-tag">AI DOCUMENT INTELLIGENCE & WORKFLOW</span>', unsafe_allow_html=True)
     st.markdown('<h1 class="main-header">AI Document Intelligence</h1>', unsafe_allow_html=True)
-    st.markdown(
-        '<p class="sub-header">Upload a document. Extract its text. Understand its type. Get useful information instantly.</p>',
-        unsafe_allow_html=True
-    )
+    st.markdown('<p class="sub-header"><strong>Understand. Classify. Extract.</strong> Ingest documents, extract normalized text, identify document types, and extract key fields with honest confidence metrics.</p>', unsafe_allow_html=True)
 
-    # -------------------------------------------------------------
-    # MAIN AREA: FILE UPLOADER & SAMPLE RESOLUTION
-    # -------------------------------------------------------------
-    file_bytes: Optional[bytes] = None
-    filename: str = ""
-    file_type: str = ""
-    file_size_bytes: int = 0
+    # Tabs for Workflow vs Model Evaluation
+    tab_workflow, tab_evaluation = st.tabs(["🚀 Document Analysis Pipeline", "📊 Model Evaluation & Benchmarks"])
 
-    uploaded_file = st.file_uploader(
-        "Upload a document (PDF, JPG, JPEG, PNG)",
-        type=["pdf", "jpg", "jpeg", "png"],
-        help="Upload an invoice, resume, or other document."
-    )
+    # =========================================================================
+    # TAB 1: WORKFLOW PIPELINE
+    # =========================================================================
+    with tab_workflow:
+        # File Upload Area
+        uploaded_file = st.file_uploader(
+            "Upload a document (PDF, JPG, JPEG, PNG):",
+            type=["pdf", "jpg", "jpeg", "png"],
+            help="Drop any invoice, resume, or business document to extract and analyze."
+        )
 
-    if uploaded_file is not None:
-        file_bytes = uploaded_file.read()
-        filename = uploaded_file.name
-        file_type = filename.split(".")[-1].lower()
-        file_size_bytes = len(file_bytes)
-    elif selected_sample != "None (Upload my own)":
-        sample_path = os.path.join(samples_dir, selected_sample)
-        if os.path.isfile(sample_path):
-            with open(sample_path, "rb") as f:
-                file_bytes = f.read()
-            filename = selected_sample
+        file_bytes: Optional[bytes] = None
+        filename: str = ""
+        file_type: str = ""
+        file_size_bytes: int = 0
+
+        if uploaded_file is not None:
+            file_bytes = uploaded_file.read()
+            filename = uploaded_file.name
             file_type = filename.split(".")[-1].lower()
             file_size_bytes = len(file_bytes)
-            st.info(f"Loaded sample file from repository: `{filename}`")
+        elif selected_sample_label != "None (Upload my own file)":
+            sample_filename = selected_sample_label.split(" ")[0]
+            sample_path = os.path.join(SAMPLES_DIR, sample_filename)
+            if os.path.isfile(sample_path):
+                with open(sample_path, "rb") as f:
+                    file_bytes = f.read()
+                filename = sample_filename
+                file_type = filename.split(".")[-1].lower()
+                file_size_bytes = len(file_bytes)
+                st.info(f"Loaded sample file: **`{filename}`**")
 
-    # -------------------------------------------------------------
-    # PROCESSING PIPELINE & RESULTS
-    # -------------------------------------------------------------
-    if file_bytes is not None:
-        # File Validation
-        allowed_extensions = ["pdf", "jpg", "jpeg", "png"]
-        if file_type not in allowed_extensions:
-            st.error("Unsupported file type. Please upload a PDF, JPG, JPEG, or PNG.")
-            return
+        # Process Document if provided
+        if file_bytes is not None:
+            # Metadata summary
+            size_kb = file_size_bytes / 1024
+            size_str = f"{size_kb:.1f} KB" if size_kb < 1024 else f"{size_kb / 1024:.2f} MB"
 
-        # Display File Metadata
-        size_kb = file_size_bytes / 1024
-        size_display = f"{size_kb:.1f} KB" if size_kb < 1024 else f"{size_kb/1024:.2f} MB"
+            col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+            with col_m1:
+                st.metric("Filename", filename)
+            with col_m2:
+                st.metric("File Type", file_type.upper())
+            with col_m3:
+                st.metric("File Size", size_str)
+            with col_m4:
+                st.metric("Active Model", selected_model)
 
-        meta_col1, meta_col2, meta_col3 = st.columns(3)
-        with meta_col1:
-            st.metric("Filename", filename)
-        with meta_col2:
-            st.metric("File Type", file_type.upper())
-        with meta_col3:
-            st.metric("File Size", size_display)
+            with st.spinner("Processing document through intelligent pipeline..."):
+                result = process_document(
+                    file_bytes=file_bytes,
+                    filename=filename,
+                    file_extension=file_type,
+                    classifier=clf,
+                    ocr_engine=ocr_engine,
+                    active_model_name=selected_model,
+                    ocr_settings=ocr_settings
+                )
 
-        # Run Document Processing
-        with st.spinner("Processing document..."):
-            result = process_document(file_bytes, filename, file_type, classification_mode=classifier_mode)
+            # Error handling
+            if result.get("error"):
+                st.error(f"Processing Note: {result['error']}")
+                return
 
-        if result.get("error"):
-            st.error(f"Error: {result['error']}")
-            if result.get("status_message"):
-                st.info(result["status_message"])
-            return
+            # Display Pipeline Progress Stages
+            st.markdown("---")
+            st.markdown("### 🔄 Processing Stages")
+            stage_html = "".join([f'<span class="stage-pill">✓ {stage}</span>' for stage in result.get("stages", [])])
+            st.markdown(stage_html, unsafe_allow_html=True)
+            st.caption(f"Extraction Route: {result['extraction_note']}")
 
-        # Clear status messages
-        st.markdown("---")
-        st.markdown("### Processing Status")
-        status_html = """
-        <span class="status-chip status-success">✓ File accepted</span>
-        <span class="status-chip status-success">✓ Text extracted</span>
-        <span class="status-chip status-success">✓ Document identified</span>
-        <span class="status-chip status-success">✓ Fields extracted</span>
-        """
-        st.markdown(status_html, unsafe_allow_html=True)
-        st.caption(f"Extraction details: {result['status_message']}")
+            # Classification & Result Section
+            st.markdown("---")
+            st.subheader("📑 Document Classification & Confidence")
 
-        # ---------------------------------------------------------
-        # RESULT SECTION
-        # ---------------------------------------------------------
-        st.markdown("---")
-        st.subheader("Document Analysis Results")
+            res_col1, res_col2 = st.columns([1, 1])
+            with res_col1:
+                st.markdown(f"### Detected Type: **{result['document_type']}**")
+                st.markdown(f"**Classifier:** `{result['classification_model']}`")
 
-        res_col1, res_col2 = st.columns([1, 1])
+            with res_col2:
+                conf = result.get("confidence", "Not Available")
+                st.markdown(f"### Confidence: **{conf}**")
+                if result.get("probabilities"):
+                    prob_str = " | ".join([f"{k}: {round(v*100)}%" for k, v in result["probabilities"].items()])
+                    st.caption(f"Class distribution: {prob_str}")
+                else:
+                    st.caption("Confidence: Probabilistic calibration is not available for this model.")
 
-        with res_col1:
-            st.markdown(f"### Detected Type: **{result['document_type']}**")
-            st.markdown(f"**Classification Method**: {result['classification_method']}")
+            # Structured Information Extraction
+            st.markdown("---")
+            st.subheader("🔍 Extracted Structured Entities")
 
-        with res_col2:
-            if result["classification_method"].startswith("Rule-based"):
-                scores = result.get("classification_details", {})
-                st.caption(f"Keyword score balance — Invoice: {scores.get('invoice_score', 0)} | Resume: {scores.get('resume_score', 0)}")
+            fields = result.get("fields", {})
+            doc_type = result.get("document_type")
+
+            if doc_type == "Invoice":
+                c1, c2 = st.columns(2)
+                c3, c4 = st.columns(2)
+
+                inv_num = fields.get("Invoice Number", NOT_FOUND)
+                inv_class = "entity-missing" if inv_num == NOT_FOUND else ""
+                with c1:
+                    st.markdown(f"""
+                    <div class="entity-card">
+                        <div class="entity-label">Invoice Number</div>
+                        <div class="entity-value {inv_class}">{inv_num}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                inv_date = fields.get("Date", NOT_FOUND)
+                date_class = "entity-missing" if inv_date == NOT_FOUND else ""
+                with c2:
+                    st.markdown(f"""
+                    <div class="entity-card">
+                        <div class="entity-label">Date</div>
+                        <div class="entity-value {date_class}">{inv_date}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                comp = fields.get("Company Name", NOT_FOUND)
+                comp_class = "entity-missing" if comp == NOT_FOUND else ""
+                with c3:
+                    st.markdown(f"""
+                    <div class="entity-card">
+                        <div class="entity-label">Company Name</div>
+                        <div class="entity-value {comp_class}">{comp}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                total = fields.get("Total Amount", NOT_FOUND)
+                total_class = "entity-missing" if total == NOT_FOUND else ""
+                with c4:
+                    st.markdown(f"""
+                    <div class="entity-card">
+                        <div class="entity-label">Total Amount</div>
+                        <div class="entity-value {total_class}">{total}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+            elif doc_type == "Resume":
+                c1, c2 = st.columns(2)
+                c3, c4 = st.columns(2)
+
+                name = fields.get("Name", NOT_FOUND)
+                name_class = "entity-missing" if name == NOT_FOUND else ""
+                with c1:
+                    st.markdown(f"""
+                    <div class="entity-card">
+                        <div class="entity-label">Candidate Name</div>
+                        <div class="entity-value {name_class}">{name}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                email = fields.get("Email", NOT_FOUND)
+                email_class = "entity-missing" if email == NOT_FOUND else ""
+                with c2:
+                    st.markdown(f"""
+                    <div class="entity-card">
+                        <div class="entity-label">Email Address</div>
+                        <div class="entity-value {email_class}">{email}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                phone = fields.get("Phone", NOT_FOUND)
+                phone_class = "entity-missing" if phone == NOT_FOUND else ""
+                with c3:
+                    st.markdown(f"""
+                    <div class="entity-card">
+                        <div class="entity-label">Phone Number</div>
+                        <div class="entity-value {phone_class}">{phone}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                skills = fields.get("Skills", NOT_FOUND)
+                skills_class = "entity-missing" if skills == NOT_FOUND else ""
+                with c4:
+                    st.markdown(f"""
+                    <div class="entity-card">
+                        <div class="entity-label">Skills & Competencies</div>
+                        <div class="entity-value {skills_class}">{skills}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
             else:
-                prob = result.get("classification_details", {})
-                st.caption(f"Class probabilities: {prob}")
+                st.info("The document is identified as **Other**. General text has been cleaned and classified. Field extraction schemas are currently tailored for Invoices and Resumes.")
 
-        # Extracted Information Cards
-        st.markdown("#### Extracted Information")
-        fields = result.get("fields", {})
+            # Missing Fields Summary Alert
+            missing_fields = result.get("missing_fields", [])
+            if missing_fields:
+                st.warning(f"⚠️ **Missing Fields Detected**: {', '.join(missing_fields)} — explicitly marked as **`Not Found`**.")
 
-        if result["document_type"] == "Invoice":
-            col_a, col_b = st.columns(2)
-            col_c, col_d = st.columns(2)
+            # Text Transparency Section
+            st.markdown("---")
+            st.subheader("📄 Text Transparency & Preprocessing")
 
-            with col_a:
-                st.markdown(f"""
-                <div class="metric-card">
-                    <div class="metric-label">Invoice Number</div>
-                    <div class="metric-value">{fields.get("Invoice Number", "Not found")}</div>
-                </div>
-                """, unsafe_allow_html=True)
+            exp1, exp2, exp3 = st.tabs(["Cleaned Text (Active Input)", "Original Extracted Text", "OCR & CV Processing"])
 
-            with col_b:
-                st.markdown(f"""
-                <div class="metric-card">
-                    <div class="metric-label">Date</div>
-                    <div class="metric-value">{fields.get("Date", "Not found")}</div>
-                </div>
-                """, unsafe_allow_html=True)
+            with exp1:
+                st.caption(f"Cleaned Characters: {result['char_count_cleaned']} | Words: {result['word_count']} | Whitespace Reduction: {result['reduction_pct']}%")
+                st.text_area("Cleaned Text Content", value=result["cleaned_text"], height=220, disabled=True)
 
-            with col_c:
-                st.markdown(f"""
-                <div class="metric-card">
-                    <div class="metric-label">Company Name</div>
-                    <div class="metric-value">{fields.get("Company Name", "Not found")}</div>
-                </div>
-                """, unsafe_allow_html=True)
+            with exp2:
+                st.caption(f"Original Characters: {result['char_count_original']}")
+                st.text_area("Raw Extracted Content", value=result["original_text"], height=220, disabled=True)
 
-            with col_d:
-                st.markdown(f"""
-                <div class="metric-card">
-                    <div class="metric-label">Total Amount</div>
-                    <div class="metric-value">{fields.get("Total Amount", "Not found")}</div>
-                </div>
-                """, unsafe_allow_html=True)
+            with exp3:
+                st.markdown(f"**OCR Used:** `{result['ocr_used']}`")
+                if result.get("ocr_steps"):
+                    st.markdown("**Image Preprocessing Steps Applied:**")
+                    for step in result["ocr_steps"]:
+                        st.markdown(f"- {step}")
+                else:
+                    st.markdown("*No OCR image preprocessing needed (Direct selectable text was used).*")
 
-        elif result["document_type"] == "Resume":
-            col_a, col_b = st.columns(2)
-            col_c, col_d = st.columns(2)
+            # Export Section
+            st.markdown("---")
+            st.subheader("💾 Export Structured Data")
+            d1, d2, d3 = st.columns(3)
 
-            with col_a:
-                st.markdown(f"""
-                <div class="metric-card">
-                    <div class="metric-label">Candidate Name</div>
-                    <div class="metric-value">{fields.get("Name", "Not found")}</div>
-                </div>
-                """, unsafe_allow_html=True)
+            with d1:
+                json_data = export_result_to_json(result)
+                st.download_button(
+                    label="⬇️ Download JSON",
+                    data=json_data,
+                    file_name=f"{filename}_analysis.json",
+                    mime="application/json",
+                    use_container_width=True
+                )
 
-            with col_b:
-                st.markdown(f"""
-                <div class="metric-card">
-                    <div class="metric-label">Email Address</div>
-                    <div class="metric-value">{fields.get("Email", "Not found")}</div>
-                </div>
-                """, unsafe_allow_html=True)
+            with d2:
+                csv_data = export_result_to_csv(result)
+                st.download_button(
+                    label="⬇️ Download CSV",
+                    data=csv_data,
+                    file_name=f"{filename}_metadata.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
 
-            with col_c:
-                st.markdown(f"""
-                <div class="metric-card">
-                    <div class="metric-label">Phone Number</div>
-                    <div class="metric-value">{fields.get("Phone", "Not found")}</div>
-                </div>
-                """, unsafe_allow_html=True)
+            with d3:
+                st.download_button(
+                    label="⬇️ Download Cleaned Text (.txt)",
+                    data=result["cleaned_text"],
+                    file_name=f"{filename}_cleaned.txt",
+                    mime="text/plain",
+                    use_container_width=True
+                )
 
-            with col_d:
-                st.markdown(f"""
-                <div class="metric-card">
-                    <div class="metric-label">Skills</div>
-                    <div class="metric-value">{fields.get("Skills", "Not found")}</div>
-                </div>
-                """, unsafe_allow_html=True)
+    # =========================================================================
+    # TAB 2: MODEL EVALUATION & BENCHMARKS
+    # =========================================================================
+    with tab_evaluation:
+        st.subheader("📊 Classifier Benchmark & Performance Comparison")
+        st.markdown(
+            "Evaluation performed across an independent, unseen test dataset (`data/test/`) "
+            "using consistent TF-IDF feature representations for fair comparison."
+        )
 
+        if eval_results:
+            # Model Comparison Table
+            df_comp = pd.DataFrame(eval_results["comparison_table"])
+            st.table(df_comp.set_index("Model"))
+
+            st.success(f"🏆 **Selected Best Performing Model:** `{eval_results['best_model_name']}` (Identified via highest Macro F1-Score)")
+
+            st.markdown("---")
+            st.subheader("🔲 Confusion Matrix Diagnostics")
+
+            model_for_cm = st.selectbox(
+                "Select Model to Inspect Confusion Matrix:",
+                options=list(eval_results["detailed_metrics"].keys()),
+                index=0
+            )
+
+            cm_data = eval_results["detailed_metrics"][model_for_cm]["confusion_matrix"]
+            classes = eval_results["classes"]
+            df_cm = pd.DataFrame(cm_data, index=[f"Actual {c}" for c in classes], columns=[f"Predicted {c}" for c in classes])
+
+            st.table(df_cm)
+
+            st.markdown("---")
+            st.subheader("📝 Explainable Diagnostic Report")
+            diag = eval_results.get("diagnostics", {})
+
+            st.markdown(f"**Strengths:** {diag.get('strengths')}")
+            st.markdown(f"**Common Confusion Patterns:** {diag.get('confusion_patterns')}")
+            st.markdown(f"**Potential Causes of Errors:** {diag.get('causes_of_errors')}")
+            st.markdown(f"**Dataset Limitations:** {diag.get('dataset_limitations')}")
         else:
-            st.info(
-                "The document is categorized as **Other**. General text was extracted successfully, "
-                "but specific field extraction schemas are currently tailored for Invoices and Resumes."
-            )
-
-        # ---------------------------------------------------------
-        # EXTRACTED TEXT SECTION
-        # ---------------------------------------------------------
-        st.markdown("---")
-        with st.expander("📄 View Extracted Document Text", expanded=False):
-            st.caption(f"Total Characters: {result['text_length']} | Words: {result['word_count']}")
-            st.text_area(
-                label="Extracted Text Content",
-                value=result["text"],
-                height=260,
-                disabled=True
-            )
-
-        # ---------------------------------------------------------
-        # EXPORT / DOWNLOAD OPTIONS
-        # ---------------------------------------------------------
-        st.markdown("#### Export Results")
-        d_col1, d_col2 = st.columns(2)
-
-        # Download JSON
-        json_output = json.dumps(result, indent=2)
-        with d_col1:
-            st.download_button(
-                label="⬇️ Download Results (JSON)",
-                data=json_output,
-                file_name=f"{filename}_analysis.json",
-                mime="application/json",
-                use_container_width=True
-            )
-
-        # Download Extracted Text
-        with d_col2:
-            st.download_button(
-                label="⬇️ Download Raw Text (.txt)",
-                data=result["text"],
-                file_name=f"{filename}_extracted_text.txt",
-                mime="text/plain",
-                use_container_width=True
-            )
+            st.warning("Evaluation metrics currently loading or test dataset is unavailable.")
 
 
 if __name__ == "__main__":
