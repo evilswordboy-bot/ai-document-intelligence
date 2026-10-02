@@ -88,7 +88,7 @@ class DocumentClassifier:
             stop_words="english"
         )
         self.models = {
-            "Logistic Regression": LogisticRegression(max_iter=1000, random_state=42),
+            "Logistic Regression": LogisticRegression(C=5.0, max_iter=1000, random_state=42),
             "Linear SVM": LinearSVC(random_state=42, max_iter=2000),
             "Naive Bayes": MultinomialNB(alpha=0.1)
         }

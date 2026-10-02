@@ -1,14 +1,15 @@
 """
-AI Document Intelligence & Workflow Platform
-Enterprise Document Management & Understanding Platform
-Persistent SQLite Repository • SHA-256 Deduplication • Multi-Field Search • SaaS UX
+AI Document Intelligence & Workflow Platform — Week 5
+Advanced Document Workflow & Automation Platform
+Controlled State Machine • Validation Engine • Rule-Based Routing
+Human Review Queue • Audit History • Fault-Tolerant Batch Processing
 """
 
 import os
 import io
 import json
 from datetime import datetime
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 
 import streamlit as st
 import pandas as pd
@@ -17,17 +18,43 @@ from PIL import Image
 # Core Services & Database
 from database.db import DatabaseManager, get_db
 from models.document import (
-    STATUS_PROCESSED,
+    STATUS_NEW,
+    STATUS_PROCESSING,
     STATUS_NEEDS_REVIEW,
+    STATUS_APPROVED,
+    STATUS_REJECTED,
+    STATUS_COMPLETED,
+    STATUS_PROCESSED,
     STATUS_FAILED,
+    WORKFLOW_STATUSES,
+    ALL_STATUSES,
     TYPE_INVOICE,
     TYPE_RESUME,
     TYPE_OTHER,
-    ALL_DOCUMENT_TYPES,
-    ALL_STATUSES
+    ALL_DOCUMENT_TYPES
 )
 from services.file_storage import FileStorageManager, get_storage_manager
+from services.validation import FileValidator, DocumentValidator
+from services.audit import (
+    AuditService,
+    get_audit_service,
+    ACTION_UPLOADED,
+    ACTION_PROCESSING_STARTED,
+    ACTION_CLASSIFIED,
+    ACTION_EXTRACTED,
+    ACTION_VALIDATION_PASSED,
+    ACTION_VALIDATION_FAILED,
+    ACTION_ROUTED_TO_REVIEW,
+    ACTION_ROUTED_TO_COMPLETED,
+    ACTION_REVIEWER_APPROVED,
+    ACTION_REVIEWER_REJECTED,
+    ACTION_WORKFLOW_COMPLETED,
+    ACTION_WORKFLOW_FAILED,
+    ACTION_RETRIED
+)
+from services.workflow import WorkflowEngine, get_workflow_engine, CONFIDENCE_THRESHOLD
 from services.document_processor import DocumentProcessor, get_document_processor
+from services.batch import BatchProcessor, get_batch_processor
 from src.classifier import DocumentClassifier
 from src.ocr_processor import OCRProcessor
 from src.evaluator import ModelEvaluator
@@ -53,14 +80,14 @@ DB_PATH = os.path.join(DATA_DIR, "documents.db")
 
 @st.cache_resource(show_spinner=False)
 def initialize_system(full: bool = False):
-    """Initializes SQLite repository, storage folders, models, and sample PDFs."""
-    # Ensure sample PDFs exist
+    """Initializes SQLite repository, storage, models, sample PDFs, and services."""
     generate_rich_sample_pdfs(SAMPLES_DIR)
 
     db = get_db(DB_PATH)
     storage = get_storage_manager(STORAGE_DIR)
+    audit = get_audit_service(db)
+    workflow = get_workflow_engine(db, audit)
 
-    # Initialize Classifier
     clf = DocumentClassifier()
     model_loaded = clf.load_model(MODEL_PATH)
 
@@ -85,10 +112,18 @@ def initialize_system(full: bool = False):
             eval_results = None
 
     ocr_engine = OCRProcessor()
-    processor = DocumentProcessor(db_manager=db, storage_manager=storage, classifier=clf, ocr_engine=ocr_engine)
+    processor = DocumentProcessor(
+        db_manager=db,
+        storage_manager=storage,
+        classifier=clf,
+        ocr_engine=ocr_engine,
+        audit_service=audit,
+        workflow_engine=workflow
+    )
+    batch_proc = BatchProcessor(processor=processor)
 
     if full:
-        return db, storage, clf, ocr_engine, processor, eval_results
+        return db, storage, clf, ocr_engine, processor, batch_proc, workflow, audit, eval_results
     return clf, ocr_engine, eval_results
 
 
@@ -98,11 +133,11 @@ def process_document(
     file_extension: str,
     classifier: DocumentClassifier,
     ocr_engine: OCRProcessor,
-    active_model_name: str,
-    ocr_settings: Dict[str, bool]
+    active_model_name: str = "Logistic Regression",
+    ocr_settings: Optional[Dict[str, bool]] = None
 ) -> Dict[str, Any]:
     """
-    Direct document processing pipeline helper (Week 3 compatibility).
+    Direct document processing pipeline helper for in-memory analysis without DB persistence.
     """
     from src.document_reader import DocumentReader
     from src.text_cleaner import TextCleaner
@@ -119,47 +154,32 @@ def process_document(
     if ext == "pdf":
         read_res = DocumentReader.read_pdf(file_bytes)
         if read_res["error"]:
-            return {"error": read_res["error"], "stages": stages}
+            return {
+                "success": False,
+                "error": read_res["error"],
+                "stages": stages + ["Failed"]
+            }
         if read_res["needs_ocr"]:
-            ocr_res = ocr_engine.ocr_pdf(file_bytes, preprocess=ocr_settings.get("preprocess", True))
+            ocr_res = ocr_engine.ocr_pdf(file_bytes, preprocess=True)
             raw_text = ocr_res["text"]
             ocr_used = True
             ocr_steps = ocr_res.get("preprocessing_steps", [])
-            extraction_note = "Scanned PDF detected — executed OCR fallback."
+            extraction_note = "Scanned PDF processed via OCR fallback."
         else:
             raw_text = read_res["text"]
-            extraction_note = f"Direct PyMuPDF selectable text extracted ({read_res['page_count']} page(s))."
-    elif ext in ("jpg", "jpeg", "png"):
-        ocr_res = ocr_engine.extract_from_image(file_bytes, preprocess=ocr_settings.get("preprocess", True))
+            extraction_note = f"Direct PyMuPDF selectable text ({read_res['page_count']} page(s))."
+    else:
+        ocr_res = ocr_engine.extract_from_image(file_bytes, preprocess=True)
         raw_text = ocr_res["text"]
         ocr_used = True
         ocr_steps = ocr_res.get("preprocessing_steps", [])
-        extraction_note = "Image processed via OCR engine."
-    else:
-        return {"error": "Unsupported file format. Please upload a PDF, JPG, JPEG, or PNG.", "stages": stages}
+        extraction_note = "Image processed via OCR computer vision engine."
 
     stages.append("Text Extracted")
+
     clean_res = TextCleaner.clean(raw_text)
     cleaned_text = clean_res["cleaned_text"]
     stages.append("Text Cleaned")
-
-    if not clean_res["is_valid"]:
-        return {
-            "filename": filename,
-            "file_type": ext.upper(),
-            "document_type": "Unreadable",
-            "confidence": "Not Available",
-            "classification_model": active_model_name,
-            "fields": {},
-            "missing_fields": [],
-            "original_text": raw_text,
-            "cleaned_text": cleaned_text,
-            "ocr_used": ocr_used,
-            "ocr_steps": ocr_steps,
-            "extraction_note": extraction_note,
-            "stages": stages,
-            "error": clean_res.get("warning") or "Unable to extract readable text from this document."
-        }
 
     pred_res = classifier.predict(cleaned_text, model_name=active_model_name)
     doc_type = pred_res["document_type"]
@@ -167,46 +187,39 @@ def process_document(
     stages.append("Document Classified")
 
     extract_res = DocumentExtractor.extract(cleaned_text, doc_type)
-    fields = extract_res["fields"]
-    missing_fields = extract_res["missing_fields"]
+    fields = extract_res.get("fields", {})
+    missing_fields = extract_res.get("missing_fields", [])
     stages.append("Fields Extracted")
-    stages.append("Missing Fields Checked")
+
+    stages.append("Pipeline Complete")
 
     return {
+        "success": True,
         "filename": filename,
         "file_type": ext.upper(),
         "document_type": doc_type,
         "confidence": confidence,
         "classification_model": active_model_name,
-        "probabilities": pred_res.get("probabilities"),
-        "fields": fields,
-        "missing_fields": missing_fields,
-        "fields_found_count": extract_res.get("fields_found_count", 0),
-        "total_fields": extract_res.get("total_fields", 0),
-        "original_text": raw_text,
-        "cleaned_text": cleaned_text,
-        "char_count_original": clean_res["char_count_original"],
-        "char_count_cleaned": clean_res["char_count_cleaned"],
-        "reduction_pct": clean_res["reduction_pct"],
-        "word_count": len(cleaned_text.split()),
         "ocr_used": ocr_used,
         "ocr_steps": ocr_steps,
         "extraction_note": extraction_note,
-        "stages": stages,
-        "error": None
+        "fields": fields,
+        "missing_fields": missing_fields,
+        "original_text": raw_text,
+        "cleaned_text": cleaned_text,
+        "stages": stages
     }
 
 
 # =============================================================================
-# UI COMPONENTS & STYLING
+# UI STYLING & CUSTOM CSS
 # =============================================================================
 
 def apply_custom_css():
     st.markdown("""
         <style>
-        /* Modern Typography & Container */
         .main-title {
-            font-size: 2.1rem;
+            font-size: 2.2rem;
             font-weight: 800;
             color: #0F172A;
             margin-bottom: 0.2rem;
@@ -217,7 +230,6 @@ def apply_custom_css():
             color: #64748B;
             margin-bottom: 1.5rem;
         }
-        /* Metric Card styling */
         .kpi-card {
             background-color: #FFFFFF;
             border: 1px solid #E2E8F0;
@@ -227,7 +239,7 @@ def apply_custom_css():
             margin-bottom: 0.75rem;
         }
         .kpi-title {
-            font-size: 0.8rem;
+            font-size: 0.75rem;
             text-transform: uppercase;
             letter-spacing: 0.05em;
             color: #64748B;
@@ -241,7 +253,7 @@ def apply_custom_css():
             line-height: 1.1;
         }
         /* Status Badges */
-        .badge-processed {
+        .badge-completed {
             background-color: #ECFDF5;
             color: #065F46;
             border: 1px solid #A7F3D0;
@@ -255,6 +267,36 @@ def apply_custom_css():
             background-color: #FFFBEB;
             color: #92400E;
             border: 1px solid #FDE68A;
+            padding: 0.25rem 0.65rem;
+            border-radius: 6px;
+            font-size: 0.78rem;
+            font-weight: 700;
+            display: inline-block;
+        }
+        .badge-approved {
+            background-color: #EFF6FF;
+            color: #1D4ED8;
+            border: 1px solid #BFDBFE;
+            padding: 0.25rem 0.65rem;
+            border-radius: 6px;
+            font-size: 0.78rem;
+            font-weight: 700;
+            display: inline-block;
+        }
+        .badge-rejected {
+            background-color: #FEF2F2;
+            color: #991B1B;
+            border: 1px solid #FECACA;
+            padding: 0.25rem 0.65rem;
+            border-radius: 6px;
+            font-size: 0.78rem;
+            font-weight: 700;
+            display: inline-block;
+        }
+        .badge-processing {
+            background-color: #FAF5FF;
+            color: #6B21A8;
+            border: 1px solid #E9D5FF;
             padding: 0.25rem 0.65rem;
             border-radius: 6px;
             font-size: 0.78rem;
@@ -281,7 +323,6 @@ def apply_custom_css():
             font-weight: 700;
             display: inline-block;
         }
-        /* Pipeline Stage Pill */
         .stage-pill {
             display: inline-flex;
             align-items: center;
@@ -300,209 +341,236 @@ def apply_custom_css():
             color: #065F46;
             border-color: #A7F3D0;
         }
-        /* Callout Box */
-        .dup-box {
-            background-color: #FFFBEB;
-            border-left: 4px solid #F59E0B;
-            padding: 1.0rem 1.2rem;
-            border-radius: 6px;
+        .audit-item {
+            border-left: 3px solid #3B82F6;
+            padding: 0.5rem 0.8rem;
+            margin-bottom: 0.5rem;
+            background-color: #F8FAFC;
+            border-radius: 0 8px 8px 0;
+            font-size: 0.85rem;
+        }
+        .review-box {
+            border: 1px solid #FDE68A;
+            background-color: #FFFDF5;
+            border-radius: 12px;
+            padding: 1.2rem;
             margin-bottom: 1.2rem;
+        }
+        .warning-pill {
+            background-color: #FEF3C7;
+            color: #92400E;
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            margin-right: 0.3rem;
+            display: inline-block;
         }
         </style>
     """, unsafe_allow_html=True)
 
 
 def render_status_badge(status: str) -> str:
-    """Formats HTML badge for document status."""
-    if status == STATUS_PROCESSED:
-        return f'<span class="badge-processed">✓ {status}</span>'
-    elif status == STATUS_NEEDS_REVIEW:
-        return f'<span class="badge-review">⚠ {status}</span>'
+    s = (status or "").strip()
+    if s in (STATUS_COMPLETED, STATUS_PROCESSED):
+        return f'<span class="badge-completed">✓ {s}</span>'
+    elif s == STATUS_NEEDS_REVIEW:
+        return f'<span class="badge-review">⚠️ Needs Review</span>'
+    elif s == STATUS_APPROVED:
+        return f'<span class="badge-approved">✓ Approved</span>'
+    elif s == STATUS_REJECTED:
+        return f'<span class="badge-rejected">✕ Rejected</span>'
+    elif s == STATUS_PROCESSING:
+        return f'<span class="badge-processing">⟳ Processing</span>'
+    elif s == STATUS_NEW:
+        return f'<span class="stage-pill">● New</span>'
     else:
-        return f'<span class="badge-failed">✕ {status}</span>'
+        return f'<span class="badge-failed">✕ Failed</span>'
 
 
-def render_type_badge(doc_type: str) -> str:
-    """Formats HTML badge for document category."""
-    return f'<span class="badge-type">{doc_type}</span>'
+def render_confidence_badge(conf: Any) -> str:
+    if conf is None or conf == "Not Available" or conf == "":
+        return '<span style="color: #64748B; font-weight: 600; font-size: 0.8rem;">Confidence: Not Available</span>'
+    if isinstance(conf, float):
+        pct = round(conf * 100)
+    elif isinstance(conf, str) and "%" in conf:
+        pct = int(conf.replace("%", "").strip())
+    else:
+        try:
+            pct = round(float(conf) * 100)
+        except Exception:
+            return f'<span style="color: #64748B; font-weight: 600;">Confidence: {conf}</span>'
+
+    color = "#059669" if pct >= 70 else "#D97706"
+    return f'<span style="color: {color}; font-weight: 700; font-size: 0.85rem;">Confidence: {pct}%</span>'
 
 
 # =============================================================================
-# VIEW: 🏠 DASHBOARD
+# VIEW 1: 🏠 DASHBOARD & KPI OVERVIEW
 # =============================================================================
 
-def render_dashboard(db: DatabaseManager, storage: FileStorageManager):
-    st.markdown('<div class="main-title">Document Intelligence Dashboard</div>', unsafe_allow_html=True)
-    st.markdown('<div class="main-subtitle">Real-time repository health, volume metrics, and recent document streams</div>', unsafe_allow_html=True)
+def render_dashboard(db: DatabaseManager, storage: FileStorageManager, workflow: WorkflowEngine):
+    st.markdown('<div class="main-title">AI Document Intelligence Dashboard</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-subtitle">Automated Intake • Controlled State Transitions • Human-in-the-Loop Review • Complete Audit History</div>', unsafe_allow_html=True)
 
     stats = db.get_statistics()
 
-    # Top Row: Volume KPI Counters
-    k1, k2, k3, k4 = st.columns(4)
-    with k1:
+    # KPI Metric Cards Row
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    with c1:
         st.markdown(f"""
             <div class="kpi-card">
-                <div class="kpi-title">Total Documents</div>
+                <div class="kpi-title">Total Ingested</div>
                 <div class="kpi-value">{stats['total']}</div>
             </div>
         """, unsafe_allow_html=True)
-    with k2:
+    with c2:
         st.markdown(f"""
             <div class="kpi-card">
-                <div class="kpi-title">Invoices Processed</div>
-                <div class="kpi-value">{stats['invoices']}</div>
+                <div class="kpi-title" style="color: #059669;">Completed</div>
+                <div class="kpi-value" style="color: #059669;">{stats['completed']}</div>
             </div>
         """, unsafe_allow_html=True)
-    with k3:
+    with c3:
+        rev_color = "#D97706" if stats['needs_review'] > 0 else "#64748B"
         st.markdown(f"""
             <div class="kpi-card">
-                <div class="kpi-title">Resumes Parsed</div>
-                <div class="kpi-value">{stats['resumes']}</div>
+                <div class="kpi-title" style="color: {rev_color};">Needs Review</div>
+                <div class="kpi-value" style="color: {rev_color};">{stats['needs_review']}</div>
             </div>
         """, unsafe_allow_html=True)
-    with k4:
+    with c4:
         st.markdown(f"""
             <div class="kpi-card">
-                <div class="kpi-title">Other Documents</div>
-                <div class="kpi-value">{stats['other']}</div>
+                <div class="kpi-title" style="color: #2563EB;">Approved</div>
+                <div class="kpi-value" style="color: #2563EB;">{stats['approved']}</div>
+            </div>
+        """, unsafe_allow_html=True)
+    with c5:
+        st.markdown(f"""
+            <div class="kpi-card">
+                <div class="kpi-title" style="color: #DC2626;">Rejected</div>
+                <div class="kpi-value" style="color: #DC2626;">{stats['rejected']}</div>
+            </div>
+        """, unsafe_allow_html=True)
+    with c6:
+        st.markdown(f"""
+            <div class="kpi-card">
+                <div class="kpi-title" style="color: #475569;">Audit Events</div>
+                <div class="kpi-value" style="color: #475569;">{stats['total_audit_events']}</div>
             </div>
         """, unsafe_allow_html=True)
 
-    # Second Row: Processing Status Counters
-    s1, s2, s3 = st.columns(3)
-    with s1:
+    # Human Review Callout Banner if items are pending review
+    if stats['needs_review'] > 0:
         st.markdown(f"""
-            <div class="kpi-card" style="border-top: 3px solid #10B981;">
-                <div class="kpi-title">🟢 Processed Cleanly</div>
-                <div class="kpi-value" style="color: #065F46;">{stats['processed']}</div>
+            <div style="background-color: #FFFBEB; border: 1px solid #FDE68A; border-radius: 10px; padding: 1rem 1.2rem; margin: 1rem 0 1.5rem 0;">
+                <h4 style="color: #92400E; margin: 0 0 0.4rem 0;">⚠️ Human Review Required ({stats['needs_review']} document(s) pending)</h4>
+                <p style="color: #78350F; margin: 0;">Documents with missing mandatory fields or low classification confidence require manual verification.</p>
             </div>
         """, unsafe_allow_html=True)
-    with s2:
-        st.markdown(f"""
-            <div class="kpi-card" style="border-top: 3px solid #F59E0B;">
-                <div class="kpi-title">🟡 Needs Human Review</div>
-                <div class="kpi-value" style="color: #92400E;">{stats['needs_review']}</div>
-            </div>
-        """, unsafe_allow_html=True)
-    with s3:
-        st.markdown(f"""
-            <div class="kpi-card" style="border-top: 3px solid #EF4444;">
-                <div class="kpi-title">🔴 Failed / Unreadable</div>
-                <div class="kpi-value" style="color: #991B1B;">{stats['failed']}</div>
-            </div>
-        """, unsafe_allow_html=True)
+        if st.button("👉 Open Human Review Queue", type="primary"):
+            st.session_state["nav_selection"] = "⚖️ Human Review Queue"
+            st.rerun()
 
+    # Visual Workflow Status & Category Charts
+    col_chart1, col_chart2 = st.columns(2)
+    with col_chart1:
+        st.markdown("##### 📊 Document Workflow Status Breakdown")
+        status_data = {
+            "Status": ["Completed", "Needs Review", "Approved", "Rejected", "Failed"],
+            "Count": [stats["completed"], stats["needs_review"], stats["approved"], stats["rejected"], stats["failed"]]
+        }
+        df_status = pd.DataFrame(status_data)
+        st.bar_chart(df_status.set_index("Status"), height=260)
+
+    with col_chart2:
+        st.markdown("##### 📁 Document Types Distribution")
+        cat_data = {
+            "Category": ["Invoice", "Resume", "Other"],
+            "Count": [stats["invoices"], stats["resumes"], stats["other"]]
+        }
+        df_cat = pd.DataFrame(cat_data)
+        st.bar_chart(df_cat.set_index("Category"), height=260)
+
+    # Live Audit Event Feed
     st.markdown("---")
-    st.subheader("🕒 Recently Ingested Documents")
-
-    recent = stats.get("recent_documents", [])
-    if not recent:
-        st.info("The repository is currently empty. Head over to the **📤 Upload Document** section to ingest your first file!")
-    else:
-        # Build clean interactive dataframe
-        table_rows = []
-        for d in recent:
-            # Determine summary entity
-            entity = d.get("company") if d["document_type"] == "Invoice" else d.get("candidate_name")
-            if not entity or entity == "Not Found":
-                entity = d.get("invoice_number", "-")
-
-            table_rows.append({
-                "ID": d["id"],
-                "Original File": d["original_filename"],
-                "Type": d["document_type"],
-                "Status": d["status"],
-                "Key Entity": entity,
-                "Uploaded At": d["upload_date"][:19].replace("T", " ")
+    st.markdown("##### ⏱️ Live System Audit Activity Feed (Recent Workflow Transitions)")
+    recent_events = db.get_recent_audit_events(limit=8)
+    if recent_events:
+        event_rows = []
+        for e in recent_events:
+            event_rows.append({
+                "Timestamp": e["timestamp"][:19].replace("T", " "),
+                "Doc ID": f"#{e['document_id']}",
+                "Filename": e.get("original_filename") or "—",
+                "Action": e["action"],
+                "From": e.get("previous_status") or "—",
+                "To": e["new_status"],
+                "Reason / Note": e.get("reviewer_note") or e.get("reason") or "—"
             })
-        df_recent = pd.DataFrame(table_rows)
-        st.dataframe(df_recent, use_container_width=True, hide_index=True)
-
-        st.caption("Tip: Select **🔎 Search Documents** or **📁 Document Repository** to inspect complete metadata, text previews, and download stored files.")
+        st.dataframe(pd.DataFrame(event_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No audit events recorded yet. Ingest documents to view the live audit activity feed.")
 
 
 # =============================================================================
-# VIEW: 📤 UPLOAD DOCUMENT
+# VIEW 2: 📤 INGEST & WORKFLOW EXECUTION (SINGLE DOCUMENT)
 # =============================================================================
 
 def render_upload_page(
     db: DatabaseManager,
     storage: FileStorageManager,
     processor: DocumentProcessor,
-    classifier: DocumentClassifier
+    clf: DocumentClassifier
 ):
-    st.markdown('<div class="main-title">Upload & Ingest Document</div>', unsafe_allow_html=True)
-    st.markdown('<div class="main-subtitle">Automated validation, cryptographic deduplication, text extraction, ML classification & persistence</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-title">Ingest & Document Workflow</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-subtitle">Automated Intake • Deduplication • OCR & Text Extraction • ML Classification • Advanced Validation • Rule Routing</div>', unsafe_allow_html=True)
 
-    # Sidebar or top option to load pre-built sample files
-    col_upload, col_sample = st.columns([3, 2])
-
-    uploaded_file = None
-    sample_file_bytes = None
-    sample_filename = None
-
-    with col_upload:
-        st.markdown("##### 📁 Upload Document from Computer")
-        uploaded_file = st.file_uploader(
-            "Choose a PDF or Image file",
-            type=["pdf", "png", "jpg", "jpeg"],
-            help="Supported formats: PDF, JPG, JPEG, PNG. Maximum size: 20MB."
-        )
-
-    with col_sample:
-        st.markdown("##### 🧪 Or Test Pre-loaded Sample Files")
-        sample_choice = st.selectbox(
-            "Select sample file:",
-            [
-                "-- Select a sample document --",
-                "invoice_1.pdf (TechCorp Solutions, $1450)",
-                "invoice_2.pdf (Apex Retailers, Rs. 78500)",
-                "invoice_missing_total.pdf (Missing Total Field)",
-                "resume_1.pdf (Alex Smith, AI Engineer)",
-                "resume_missing_phone.pdf (Missing Phone Field)",
-                "meeting_minutes.pdf (Other Category)"
-            ]
-        )
-        if sample_choice != "-- Select a sample document --":
-            sample_filename = sample_choice.split(" ")[0]
-            sample_path = os.path.join(SAMPLES_DIR, sample_filename)
-            if os.path.isfile(sample_path):
-                with open(sample_path, "rb") as f:
-                    sample_file_bytes = f.read()
-                st.success(f"Loaded `{sample_filename}` ({len(sample_file_bytes)} bytes)")
-
-    # Advanced Processing Configurations
-    with st.expander("⚙️ Advanced Pipeline Configurations", expanded=False):
-        c1, c2 = st.columns(2)
-        with c1:
-            active_model = st.selectbox(
-                "Active Classification Model:",
-                ["Logistic Regression", "Linear SVM", "Naive Bayes", "Rule-Based Baseline"],
-                index=0
-            )
-        with c2:
-            apply_preprocess = st.checkbox(
-                "Apply OCR Image Preprocessing (Grayscale + Thresholding + Denoise)",
-                value=True
-            )
-
-    # Process Document Button
+    c1, c2 = st.columns([1, 1])
     file_to_process = None
-    filename_to_process = None
+    filename_to_process = ""
 
-    if uploaded_file is not None:
-        file_to_process = uploaded_file.getvalue()
-        filename_to_process = uploaded_file.name
-    elif sample_file_bytes is not None:
-        file_to_process = sample_file_bytes
-        filename_to_process = sample_filename
+    with c1:
+        st.markdown("##### 📁 Option A: Upload Custom Document")
+        uploaded_file = st.file_uploader(
+            "Select PDF or Image (PNG, JPG, JPEG):",
+            type=["pdf", "png", "jpg", "jpeg"],
+            help="Files are verified against whitelisted formats and SHA-256 deduplicated."
+        )
+        if uploaded_file is not None:
+            file_to_process = uploaded_file.getvalue()
+            filename_to_process = uploaded_file.name
+
+    with c2:
+        st.markdown("##### 🧪 Option B: Load Rich Test Sample")
+        sample_files = sorted([f for f in os.listdir(SAMPLES_DIR) if f.endswith(".pdf")])
+        selected_sample = st.selectbox("Choose pre-built sample document:", ["-- Select Sample --"] + sample_files)
+        if selected_sample != "-- Select Sample --":
+            sample_path = os.path.join(SAMPLES_DIR, selected_sample)
+            with open(sample_path, "rb") as f:
+                file_to_process = f.read()
+            filename_to_process = selected_sample
+            st.info(f"Loaded sample: `{selected_sample}` ({len(file_to_process)} bytes)")
+
+    # Model & OCR Settings
+    st.markdown("---")
+    st.markdown("##### ⚙️ Pipeline Configuration")
+    col_cfg1, col_cfg2 = st.columns(2)
+    with col_cfg1:
+        active_model = st.selectbox(
+            "Classification Engine:",
+            ["Logistic Regression", "Linear SVM", "Naive Bayes", "Rule-Based Baseline"],
+            index=0,
+            help="Logistic Regression & Naive Bayes calculate calibrated confidence probabilities."
+        )
+    with col_cfg2:
+        apply_preprocess = st.checkbox("Enable Adaptive OCR Preprocessing (Binarization & Denoising)", value=True)
 
     if file_to_process:
         st.markdown("---")
-        process_btn = st.button("🚀 Ingest & Process Document", type="primary", use_container_width=True)
-
-        if process_btn:
-            with st.spinner("Processing document through AI intelligence pipeline..."):
+        if st.button("🚀 Ingest & Execute Document Workflow", type="primary", use_container_width=True):
+            with st.spinner("Executing end-to-end document intelligence pipeline..."):
                 result = processor.process_and_store(
                     file_bytes=file_to_process,
                     original_filename=filename_to_process,
@@ -513,26 +581,18 @@ def render_upload_page(
             # Check for Duplicate
             if result.get("is_duplicate"):
                 existing = result["document"]
-                st.markdown(f"""
-                    <div class="dup-box">
-                        <h4 style="color: #B45309; margin-top: 0;">⚠️ Duplicate Document Suppressed</h4>
-                        <p>{result['message']}</p>
-                        <p><strong>SHA-256 Digest:</strong> <code>{result['file_hash']}</code></p>
-                    </div>
-                """, unsafe_allow_html=True)
-
-                st.subheader("Existing Document Record in Repository")
+                st.warning(f"⚠️ Duplicate Suppressed: '{filename_to_process}' is identical to existing Document #{existing['id']}.")
                 render_single_document_details(existing, storage, db)
                 return
 
             if not result.get("success"):
-                st.error(f"Processing Failed: {result.get('error')}")
+                st.error(f"Workflow Processing Failed: {result.get('error')}")
                 if "document" in result and result["document"]:
-                    st.warning("Document was recorded in SQLite as 'Failed' for audit logging.")
+                    st.warning("Document was recorded in SQLite with 'Failed' status and audit log.")
                 return
 
             # Display Pipeline Success Stages
-            st.success("🎉 Document successfully processed and committed to repository!")
+            st.success("🎉 Document workflow successfully executed and recorded!")
             st.markdown("##### 📌 Workflow Execution Trail:")
             stage_html = " ".join([f'<span class="stage-pill done">✓ {s}</span>' for s in result.get("stages", [])])
             st.markdown(stage_html, unsafe_allow_html=True)
@@ -543,36 +603,273 @@ def render_upload_page(
 
 
 # =============================================================================
-# VIEW: 🔎 SEARCH & FILTER DOCUMENTS
+# VIEW 3: ⚡ BATCH WORKFLOW PROCESSING
+# =============================================================================
+
+def render_batch_page(
+    db: DatabaseManager,
+    storage: FileStorageManager,
+    batch_proc: BatchProcessor,
+    clf: DocumentClassifier
+):
+    st.markdown('<div class="main-title">Batch Document Processing</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-subtitle">High-Throughput Parallel Ingestion • Isolated Error Boundaries • Non-Blocking Fault Tolerance</div>', unsafe_allow_html=True)
+
+    st.markdown("""
+        > **Fault-Tolerant Execution Guarantee:** Batch items execute inside isolated transaction boundaries.
+        > An unreadable, corrupt, or invalid file in one item **never halts or halts the batch**.
+    """)
+
+    uploaded_files = st.file_uploader(
+        "Upload multiple document files (PDF, PNG, JPG, JPEG):",
+        type=["pdf", "png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+        help="Select multiple documents for batch ingestion."
+    )
+
+    c_opt1, c_opt2 = st.columns([2, 1])
+    with c_opt1:
+        batch_model = st.selectbox(
+            "Batch Classifier:",
+            ["Logistic Regression", "Linear SVM", "Naive Bayes", "Rule-Based Baseline"],
+            index=0
+        )
+    with c_opt2:
+        st.markdown("<br>", unsafe_allow_html=True)
+        load_samples_btn = st.button("📁 Load 6 Sample Test Documents", use_container_width=True)
+
+    files_to_process: List[Tuple[str, bytes]] = []
+
+    if uploaded_files:
+        for f in uploaded_files:
+            files_to_process.append((f.name, f.getvalue()))
+
+    if load_samples_btn:
+        sample_names = [
+            "invoice_1.pdf", "invoice_2.pdf", "invoice_missing_total.pdf",
+            "resume_1.pdf", "resume_missing_phone.pdf", "meeting_minutes.pdf"
+        ]
+        files_to_process = []
+        for sname in sample_names:
+            spath = os.path.join(SAMPLES_DIR, sname)
+            if os.path.exists(spath):
+                with open(spath, "rb") as f:
+                    files_to_process.append((sname, f.read()))
+        st.session_state["batch_files_loaded"] = files_to_process
+        st.info(f"Loaded {len(files_to_process)} standard test files into batch queue.")
+
+    if "batch_files_loaded" in st.session_state and not uploaded_files:
+        files_to_process = st.session_state["batch_files_loaded"]
+
+    if files_to_process:
+        st.markdown(f"**Ready to process `{len(files_to_process)}` document(s) in batch.**")
+        if st.button("⚡ Start Batch Workflow", type="primary", use_container_width=True):
+            progress_bar = st.progress(0.0)
+            status_text = st.empty()
+
+            def progress_hook(idx, total, fname, status):
+                pct = idx / total
+                progress_bar.progress(pct)
+                status_text.text(f"Processing ({idx}/{total}): {fname} [{status}]")
+
+            summary = batch_proc.process_batch(
+                files=files_to_process,
+                active_model_name=batch_model,
+                progress_callback=progress_hook
+            )
+
+            progress_bar.progress(1.0)
+            status_text.text(f"Batch completed! Processed {summary['total']} document(s).")
+
+            # Batch Summary Metrics
+            st.markdown("### 📊 Batch Execution Summary")
+            b1, b2, b3, b4, b5 = st.columns(5)
+            with b1:
+                st.metric("Total Batch Items", summary["total"])
+            with b2:
+                st.metric("Completed", summary["completed"])
+            with b3:
+                st.metric("Needs Review", summary["needs_review"])
+            with b4:
+                st.metric("Failed", summary["failed"])
+            with b5:
+                st.metric("Duplicates", summary["duplicates"])
+
+            # Itemized Results Table
+            st.markdown("##### 📋 Itemized Execution Results")
+            item_rows = []
+            for r in summary["results"]:
+                doc_id = r.get("document_id") or (r.get("document", {}).get("id") if r.get("document") else "—")
+                item_rows.append({
+                    "Document ID": f"#{doc_id}",
+                    "Filename": r.get("filename", "unknown"),
+                    "Type": r.get("document_type") or (r.get("document", {}).get("document_type") if r.get("document") else "—"),
+                    "Status": r.get("status", "Failed"),
+                    "Confidence": r.get("confidence") or "—",
+                    "Details / Reason": r.get("status_reason") or r.get("error") or "Passed checks"
+                })
+
+            st.dataframe(pd.DataFrame(item_rows), use_container_width=True, hide_index=True)
+
+
+# =============================================================================
+# VIEW 4: ⚖️ HUMAN REVIEW QUEUE
+# =============================================================================
+
+def render_review_queue_page(
+    db: DatabaseManager,
+    storage: FileStorageManager,
+    workflow: WorkflowEngine,
+    audit: AuditService
+):
+    st.markdown('<div class="main-title">Human Review Queue</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-subtitle">Dedicated Review Interface • Action Approvals & Rejections • Mandatory Rejection Auditing</div>', unsafe_allow_html=True)
+
+    pending_docs = db.get_documents_by_status(STATUS_NEEDS_REVIEW)
+
+    if not pending_docs:
+        st.markdown("""
+            <div style="background-color: #ECFDF5; border: 1px solid #A7F3D0; border-radius: 12px; padding: 2rem; text-align: center; margin: 2rem 0;">
+                <h3 style="color: #065F46; margin-top: 0;">🎉 All Caught Up!</h3>
+                <p style="color: #047857; margin-bottom: 0;">There are currently 0 documents requiring human review. All ingested documents have completed validation.</p>
+            </div>
+        """, unsafe_allow_html=True)
+        return
+
+    st.markdown(f"**Found `{len(pending_docs)}` document(s) pending human review.**")
+
+    for doc in pending_docs:
+        doc_id = doc["id"]
+        with st.container():
+            st.markdown(f"""
+                <div class="review-box">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                        <h4 style="margin: 0; color: #0F172A;">Document #{doc_id}: {doc['original_filename']}</h4>
+                        <div>
+                            <span class="badge-type">{doc['document_type']}</span>
+                            {render_status_badge(doc['status'])}
+                        </div>
+                    </div>
+                    <p style="color: #64748B; font-size: 0.85rem; margin: 0 0 0.8rem 0;">
+                        Uploaded: <code>{doc['upload_date'][:19].replace('T', ' ')}</code> |
+                        Digest: <code>{doc['file_hash'][:16]}...</code> |
+                        {render_confidence_badge(doc.get('confidence_score'))}
+                    </p>
+                    <div style="background-color: #FEF3C7; border: 1px solid #FDE68A; border-radius: 8px; padding: 0.6rem 0.8rem; margin-bottom: 0.8rem;">
+                        <strong style="color: #92400E;">⚠️ Reason Flagged for Review:</strong>
+                        <span style="color: #78350F;">{doc.get('status_reason', 'Validation checks flagged for review.')}</span>
+                    </div>
+                </div>
+            """, unsafe_allow_html=True)
+
+            col_fields, col_actions = st.columns([3, 2])
+
+            with col_fields:
+                st.markdown("##### 📋 Extracted Entities")
+                if doc["document_type"] == TYPE_INVOICE:
+                    f_data = [
+                        ("Invoice Number", doc.get("invoice_number", "Not Found")),
+                        ("Company / Vendor", doc.get("company", "Not Found")),
+                        ("Total Amount", doc.get("total_amount", "Not Found")),
+                    ]
+                elif doc["document_type"] == TYPE_RESUME:
+                    f_data = [
+                        ("Candidate Name", doc.get("candidate_name", "Not Found")),
+                        ("Email Address", doc.get("candidate_email", "Not Found")),
+                        ("Phone Number", doc.get("candidate_phone", "Not Found")),
+                        ("Skills", doc.get("candidate_skills", "Not Found")),
+                    ]
+                else:
+                    f_data = [("Category Notice", "Document classified as 'Other'.")]
+
+                for k, v in f_data:
+                    val_color = "#94A3B8" if v == "Not Found" else "#0F172A"
+                    st.markdown(f"**{k}:** <span style='color: {val_color}; font-weight: 600;'>{v}</span>", unsafe_allow_html=True)
+
+                with st.expander("📄 View Extracted Text Preview"):
+                    st.text_area("Extracted Text", doc.get("text_preview", ""), height=140, disabled=True, key=f"preview_{doc_id}")
+
+            with col_actions:
+                st.markdown("##### ⚖️ Reviewer Actions")
+                reviewer_note = st.text_input(
+                    "Reviewer Note / Decision Reason:",
+                    placeholder="Enter approval note or mandatory rejection reason...",
+                    key=f"note_{doc_id}"
+                )
+
+                c_app, c_rej = st.columns(2)
+                with c_app:
+                    if st.button("✓ Approve", key=f"btn_app_{doc_id}", type="primary", use_container_width=True):
+                        ok, msg = workflow.approve_document(doc_id, reviewer_note=reviewer_note)
+                        if ok:
+                            st.success(f"Document #{doc_id} Approved & Completed!")
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
+                with c_rej:
+                    if st.button("✕ Reject", key=f"btn_rej_{doc_id}", type="secondary", use_container_width=True):
+                        # Strict enforcement: note is required
+                        if not reviewer_note.strip():
+                            st.error("Rejection note is mandatory! Please explain the reason for rejection.")
+                        else:
+                            ok, msg = workflow.reject_document(doc_id, reviewer_note=reviewer_note)
+                            if ok:
+                                st.warning(f"Document #{doc_id} Rejected.")
+                                st.rerun()
+                            else:
+                                st.error(msg)
+
+                if st.button("⟳ Re-process Document", key=f"btn_re_{doc_id}", use_container_width=True):
+                    ok, msg = workflow.reprocess_document(doc_id, reviewer_note="Queued for reprocessing by reviewer.")
+                    if ok:
+                        st.info(f"Document #{doc_id} moved back to Processing.")
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+            # Audit History for this document
+            with st.expander(f"📜 View Lifecycle Audit Trail for Document #{doc_id}"):
+                history = audit.get_document_history(doc_id)
+                for h in history:
+                    note_str = f" | Note: {h['reviewer_note']}" if h.get('reviewer_note') else ""
+                    st.markdown(f"""
+                        <div class="audit-item">
+                            <strong>{h['action']}</strong>: <code>{h['previous_status']}</code> → <code>{h['new_status']}</code>
+                            <br><small style="color: #64748B;">{h['timestamp'][:19].replace('T', ' ')} | {h.get('reason') or ''}{note_str}</small>
+                        </div>
+                    """, unsafe_allow_html=True)
+
+            st.markdown("---")
+
+
+# =============================================================================
+# VIEW 5: 🔎 SEARCH & FILTER DOCUMENTS
 # =============================================================================
 
 def render_search_page(db: DatabaseManager, storage: FileStorageManager):
     st.markdown('<div class="main-title">Search & Filter Documents</div>', unsafe_allow_html=True)
-    st.markdown('<div class="main-subtitle">Fast, multi-field parameterized discovery across metadata, text content, and extracted entities</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-subtitle">Fast Parameterized Querying Across Workflow States, Document Types, and Extracted Fields</div>', unsafe_allow_html=True)
 
-    # Search Box & Filters
-    with st.container():
-        query = st.text_input(
-            "🔍 Global Document Search:",
-            placeholder="Search by filename, company, invoice number, candidate, or full text...",
-            help="Queries SQLite using parameterized LIKE indexing."
-        )
+    query = st.text_input(
+        "🔍 Global Search Query:",
+        placeholder="Search by filename, company, invoice number, candidate, or full text...",
+        help="Parameterized SQL index lookup."
+    )
 
-        f1, f2, f3, f4 = st.columns([2, 2, 2, 1])
-        with f1:
-            doc_type_filter = st.selectbox("Document Category:", ["All"] + ALL_DOCUMENT_TYPES, index=0)
-        with f2:
-            status_filter = st.selectbox("Processing Status:", ["All"] + ALL_STATUSES, index=0)
-        with f3:
-            sort_order = st.selectbox("Sort Order:", ["Newest First", "Oldest First"], index=0)
-        with f4:
-            st.markdown("<br>", unsafe_allow_html=True)
-            if st.button("Reset Filters", use_container_width=True):
-                st.rerun()
+    f1, f2, f3, f4 = st.columns([2, 2, 2, 1])
+    with f1:
+        doc_type_filter = st.selectbox("Category:", ["All"] + ALL_DOCUMENT_TYPES, index=0)
+    with f2:
+        status_filter = st.selectbox("Workflow State:", ["All"] + WORKFLOW_STATUSES, index=0)
+    with f3:
+        sort_order = st.selectbox("Sort Order:", ["Newest First", "Oldest First"], index=0)
+    with f4:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("Reset", use_container_width=True):
+            st.rerun()
 
     sql_sort = "DESC" if "Newest" in sort_order else "ASC"
-
-    # Execute search query
     results = db.search_documents(
         search_query=query,
         doc_type=doc_type_filter,
@@ -581,278 +878,172 @@ def render_search_page(db: DatabaseManager, storage: FileStorageManager):
         limit=100
     )
 
-    st.markdown(f"**Found {len(results)} matching document(s)**")
-
-    if not results:
-        st.warning("No documents matched your criteria. Try adjusting your query or resetting the filters.")
-        return
-
-    # Display results as structured cards
-    for doc in results:
-        with st.container():
-            st.markdown(f"""
-                <div style="border: 1px solid #E2E8F0; border-radius: 10px; padding: 1rem 1.25rem; margin-bottom: 0.75rem; background: #FFFFFF;">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.4rem;">
-                        <span style="font-size: 1.1rem; font-weight: 700; color: #0F172A;">
-                            #{doc['id']} — {doc['original_filename']}
-                        </span>
-                        <div>
-                            {render_type_badge(doc['document_type'])}
-                            {render_status_badge(doc['status'])}
-                        </div>
-                    </div>
-                    <div style="font-size: 0.85rem; color: #64748B; margin-bottom: 0.5rem;">
-                        <strong>Uploaded:</strong> {doc['upload_date'][:19].replace('T', ' ')} | 
-                        <strong>Stored Filename:</strong> <code>{doc['stored_filename']}</code>
-                    </div>
-                </div>
-            """, unsafe_allow_html=True)
-
-            col_details, col_actions = st.columns([4, 1])
-            with col_details:
-                # Key extracted highlights
-                if doc["document_type"] == TYPE_INVOICE:
-                    st.markdown(f"**Company:** `{doc['company']}` | **Invoice #:** `{doc['invoice_number']}` | **Total:** `{doc['total_amount']}`")
-                elif doc["document_type"] == TYPE_RESUME:
-                    st.markdown(f"**Candidate:** `{doc['candidate_name']}` | **Email:** `{doc['candidate_email']}` | **Phone:** `{doc['candidate_phone']}`")
-                else:
-                    st.markdown(f"**Text Snippet:** *{doc['text_preview'][:160]}...*")
-
-            with col_actions:
-                if st.button("Inspect Details", key=f"btn_inspect_{doc['id']}", use_container_width=True):
-                    st.session_state["selected_doc_id"] = doc["id"]
-
-    # If a document is selected, render its full details panel
-    if st.session_state.get("selected_doc_id"):
-        st.markdown("---")
-        st.subheader(f"📑 Document Inspection Panel (ID #{st.session_state['selected_doc_id']})")
-        selected_record = db.get_document_by_id(st.session_state["selected_doc_id"])
-        if selected_record:
-            render_single_document_details(selected_record, storage, db)
-            if st.button("Close Inspection", use_container_width=False):
-                st.session_state["selected_doc_id"] = None
-                st.rerun()
+    st.markdown(f"**Found `{len(results)}` matching document record(s):**")
+    if results:
+        table_rows = []
+        for r in results:
+            table_rows.append({
+                "ID": f"#{r['id']}",
+                "Filename": r["original_filename"],
+                "Category": r["document_type"],
+                "Workflow Status": r["status"],
+                "Company / Name": r["company"] if r["document_type"] == "Invoice" else r["candidate_name"],
+                "Total / Email": r["total_amount"] if r["document_type"] == "Invoice" else r["candidate_email"],
+                "Upload Date": r["upload_date"][:10]
+            })
+        st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
 
 
 # =============================================================================
-# VIEW: 📁 DOCUMENT REPOSITORY
+# VIEW 6: 📁 DOCUMENT REPOSITORY & AUDIT VIEWER
 # =============================================================================
 
-def render_repository_page(db: DatabaseManager, storage: FileStorageManager):
-    st.markdown('<div class="main-title">Document Repository</div>', unsafe_allow_html=True)
-    st.markdown('<div class="main-subtitle">Centralized document inventory, metadata inspection, and download vault</div>', unsafe_allow_html=True)
+def render_repository_page(
+    db: DatabaseManager,
+    storage: FileStorageManager,
+    workflow: WorkflowEngine,
+    audit: AuditService
+):
+    st.markdown('<div class="main-title">Document Vault & Repository</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-subtitle">Persistent SQLite Repository with Full Entity Inspector and Visual Audit Timeline</div>', unsafe_allow_html=True)
 
     all_docs = db.get_all_documents(sort_order="DESC")
-
     if not all_docs:
-        st.info("No documents are currently stored in the repository.")
+        st.info("The repository vault is empty. Ingest documents to begin.")
         return
 
-    # Tabs for fast category filtering
-    tab_all, tab_inv, tab_res, tab_oth, tab_review = st.tabs([
-        f"All Documents ({len(all_docs)})",
-        f"Invoices ({sum(1 for d in all_docs if d['document_type'] == 'Invoice')})",
-        f"Resumes ({sum(1 for d in all_docs if d['document_type'] == 'Resume')})",
-        f"Other ({sum(1 for d in all_docs if d['document_type'] not in ('Invoice', 'Resume'))})",
-        f"Needs Review ({sum(1 for d in all_docs if d['status'] == STATUS_NEEDS_REVIEW)})"
-    ])
+    doc_options = {f"#{d['id']} - {d['original_filename']} ({d['document_type']} | {d['status']})": d['id'] for d in all_docs}
+    selected_label = st.selectbox("Select document to inspect:", list(doc_options.keys()))
+    selected_id = doc_options[selected_label]
 
-    def render_repo_table(docs_subset: List[Dict[str, Any]], tab_key: str):
-        if not docs_subset:
-            st.info("No documents match this category.")
-            return
-
-        rows = []
-        for d in docs_subset:
-            rows.append({
-                "ID": d["id"],
-                "Filename": d["original_filename"],
-                "Category": d["document_type"],
-                "Status": d["status"],
-                "Company / Candidate": d["company"] if d["document_type"] == "Invoice" else d["candidate_name"],
-                "Invoice # / Email": d["invoice_number"] if d["document_type"] == "Invoice" else d["candidate_email"],
-                "Amount / Phone": d["total_amount"] if d["document_type"] == "Invoice" else d["candidate_phone"],
-                "Uploaded Date": d["upload_date"][:19].replace("T", " ")
-            })
-        df_sub = pd.DataFrame(rows)
-        st.dataframe(df_sub, use_container_width=True, hide_index=True)
-
-        # Quick Inspection Selector
-        doc_ids = [d["id"] for d in docs_subset]
-        selected_id = st.selectbox(
-            "Select Document ID to View / Download:",
-            options=doc_ids,
-            key=f"select_doc_{tab_key}",
-            format_func=lambda x: f"ID #{x} — {next((d['original_filename'] for d in docs_subset if d['id'] == x), '')}"
-        )
-        if selected_id:
-            doc_record = db.get_document_by_id(selected_id)
-            if doc_record:
-                st.markdown("---")
-                render_single_document_details(doc_record, storage, db)
-
-    with tab_all:
-        render_repo_table(all_docs, "all")
-    with tab_inv:
-        render_repo_table([d for d in all_docs if d["document_type"] == "Invoice"], "inv")
-    with tab_res:
-        render_repo_table([d for d in all_docs if d["document_type"] == "Resume"], "res")
-    with tab_oth:
-        render_repo_table([d for d in all_docs if d["document_type"] not in ("Invoice", "Resume")], "oth")
-    with tab_review:
-        render_repo_table([d for d in all_docs if d["status"] == STATUS_NEEDS_REVIEW], "rev")
+    doc = db.get_document_by_id(selected_id)
+    if doc:
+        render_single_document_details(doc, storage, db, workflow=workflow, audit=audit)
 
 
 # =============================================================================
-# VIEW: 📊 ANALYTICS & BENCHMARK
+# VIEW 7: 📜 SYSTEM-WIDE AUDIT TRAIL
+# =============================================================================
+
+def render_audit_trail_page(db: DatabaseManager, audit: AuditService):
+    st.markdown('<div class="main-title">System Audit Trail</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-subtitle">Immutable, Chronological Log of All Automated Pipeline Stages and Human Reviewer Actions</div>', unsafe_allow_html=True)
+
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        action_filter = st.selectbox("Filter by Action:", ["All Actions"] + [
+            ACTION_UPLOADED, ACTION_PROCESSING_STARTED, ACTION_CLASSIFIED, ACTION_EXTRACTED,
+            ACTION_VALIDATION_PASSED, ACTION_VALIDATION_FAILED, ACTION_ROUTED_TO_REVIEW,
+            ACTION_ROUTED_TO_COMPLETED, ACTION_REVIEWER_APPROVED, ACTION_REVIEWER_REJECTED,
+            ACTION_WORKFLOW_COMPLETED, ACTION_WORKFLOW_FAILED, ACTION_RETRIED
+        ])
+    with c2:
+        limit_num = st.selectbox("Records limit:", [25, 50, 100, 200], index=1)
+
+    events = db.get_recent_audit_events(limit=limit_num)
+    if action_filter != "All Actions":
+        events = [e for e in events if e["action"] == action_filter]
+
+    st.markdown(f"**Displaying `{len(events)}` audit log entry/entries:**")
+    if events:
+        table_rows = []
+        for e in events:
+            table_rows.append({
+                "Audit ID": f"#{e['audit_id']}",
+                "Timestamp": e["timestamp"][:19].replace("T", " "),
+                "Document": f"#{e['document_id']} ({e.get('original_filename') or '—'})",
+                "Action": e["action"],
+                "State Transition": f"{e.get('previous_status') or 'None'} → {e['new_status']}",
+                "Reason / Routing": e.get("reason") or "—",
+                "Reviewer Note": e.get("reviewer_note") or "—"
+            })
+        st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+
+
+# =============================================================================
+# VIEW 8: 📊 WORKFLOW ANALYTICS & ML BENCHMARK
 # =============================================================================
 
 def render_analytics_page(db: DatabaseManager, eval_results: Optional[Dict[str, Any]]):
-    st.markdown('<div class="main-title">Analytics & Machine Learning Benchmarks</div>', unsafe_allow_html=True)
-    st.markdown('<div class="main-subtitle">Repository distribution breakdown, model evaluation metrics, and confusion matrix</div>', unsafe_allow_html=True)
-
-    stats = db.get_statistics()
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("📊 Category Distribution")
-        cat_data = pd.DataFrame({
-            "Category": ["Invoices", "Resumes", "Other"],
-            "Count": [stats["invoices"], stats["resumes"], stats["other"]]
-        })
-        st.bar_chart(cat_data.set_index("Category"))
-
-    with c2:
-        st.subheader("🚦 Processing Health Status")
-        status_data = pd.DataFrame({
-            "Status": ["Processed", "Needs Review", "Failed"],
-            "Count": [stats["processed"], stats["needs_review"], stats["failed"]]
-        })
-        st.bar_chart(status_data.set_index("Status"))
-
-    st.markdown("---")
-    st.subheader("🧪 Machine Learning Classifier Evaluation (Test Corpus)")
+    st.markdown('<div class="main-title">Analytics & ML Model Benchmarks</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-subtitle">Model Performance Metrics • Accuracy, Precision, Recall, and F1-Score Comparisons</div>', unsafe_allow_html=True)
 
     if eval_results and "comparison_table" in eval_results:
-        df_comp = pd.DataFrame(eval_results["comparison_table"])
-        st.dataframe(df_comp, use_container_width=True, hide_index=True)
+        st.markdown("##### 🏆 Classifier Comparison Benchmark Table")
+        st.dataframe(pd.DataFrame(eval_results["comparison_table"]), use_container_width=True, hide_index=True)
+        st.success(f"Recommended Model: **{eval_results.get('best_model_name')}** (Evaluated across Accuracy and F1-Score)")
 
-        st.markdown("##### 3x3 Multi-Class Confusion Matrix (Test Partition)")
-        best_name = eval_results.get("best_model_name", "Logistic Regression")
-        if best_name in eval_results.get("detailed_metrics", {}):
-            cm = eval_results["detailed_metrics"][best_name]["confusion_matrix"]
-            classes = eval_results["classes"]
-            df_cm = pd.DataFrame(cm, index=[f"Actual {c}" for c in classes], columns=[f"Pred {c}" for c in classes])
-            st.table(df_cm)
-
-        if "diagnostics" in eval_results:
-            diag = eval_results["diagnostics"]
-            with st.expander("🔍 Scientific Diagnostics & Error Analysis", expanded=True):
-                st.markdown(f"**Top Model Strengths:** {diag.get('strengths')}")
-                st.markdown(f"**Confusion Patterns:** {diag.get('confusion_patterns')}")
-                st.markdown(f"**Error Root Causes:** {diag.get('causes_of_errors')}")
-                st.markdown(f"**Dataset Boundaries:** {diag.get('dataset_limitations')}")
-    else:
-        st.info("Evaluation benchmark metrics not available. Ensure test dataset is present in `data/test/`.")
+    stats = db.get_statistics()
+    st.markdown("---")
+    st.markdown("##### 📈 Workflow State Distribution")
+    s_df = pd.DataFrame([
+        {"Status": "Completed", "Count": stats["completed"]},
+        {"Status": "Needs Review", "Count": stats["needs_review"]},
+        {"Status": "Approved", "Count": stats["approved"]},
+        {"Status": "Rejected", "Count": stats["rejected"]},
+        {"Status": "Failed", "Count": stats["failed"]}
+    ])
+    st.bar_chart(s_df.set_index("Status"))
 
 
 # =============================================================================
-# VIEW: ⚙️ SETTINGS & HEALTH
+# VIEW 9: ⚙️ SETTINGS & HEALTH
 # =============================================================================
 
 def render_settings_page(db: DatabaseManager, storage: FileStorageManager, ocr_engine: OCRProcessor):
     st.markdown('<div class="main-title">System Settings & Health</div>', unsafe_allow_html=True)
-    st.markdown('<div class="main-subtitle">Storage directory inspection, database health, and OCR discovery status</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-subtitle">Hardware Engine Health • Physical Storage Status • Database Integrity</div>', unsafe_allow_html=True)
 
     c1, c2 = st.columns(2)
     with c1:
-        st.markdown("##### 🗄️ SQLite Database Health")
-        st.write(f"**Database Path:** `{db.db_path}`")
-        if os.path.isfile(db.db_path):
-            size_kb = round(os.path.getsize(db.db_path) / 1024, 2)
-            st.write(f"**Database File Size:** `{size_kb} KB`")
-            st.write(f"**WAL Journal:** Enabled (`journal_mode=WAL`)")
+        st.markdown("##### 🔍 Optical Character Recognition (OCR) Engine")
+        if ocr_engine.tesseract_available:
+            st.success("✓ Tesseract OCR binary is active and ready.")
         else:
-            st.warning("Database file not yet created.")
-
-        st.markdown("##### 📁 Storage Vault Health")
-        st.write(f"**Storage Directory:** `{storage.storage_base}`")
-        for sub in ("invoices", "resumes", "other"):
-            sub_path = os.path.join(storage.storage_base, sub)
-            count = len(os.listdir(sub_path)) if os.path.isdir(sub_path) else 0
-            st.write(f"- `storage/{sub}/`: **{count}** files stored")
+            st.warning("⚠️ Tesseract OCR binary not found on PATH. Synthetic & selectable PDF parser active.")
 
     with c2:
-        st.markdown("##### 🔍 OCR Engine Discovery")
-        if ocr_engine.tesseract_available:
-            st.success("✓ Tesseract OCR engine discovered and operational on host system.")
-        else:
-            st.warning("⚠ Tesseract OCR engine was not auto-detected on PATH. Native PDF digital extraction is fully functional; install Tesseract to enable scanned image OCR.")
+        st.markdown("##### 💾 Storage & Vault Status")
+        st.info(f"Database Path: `{db.db_path}`\n\nStorage Root: `{storage.storage_dir}`")
 
-        st.markdown("##### 🧹 Maintenance Actions")
-        if st.button("Delete All Database Records & Storage (Reset Repository)"):
-            all_docs = db.get_all_documents()
-            for d in all_docs:
-                storage.delete_file(d["file_path"])
-                db.delete_document(d["id"])
-            st.success("Repository and storage vault cleared successfully.")
-            st.rerun()
+    st.markdown("---")
+    if st.button("🔄 Regenerate All 12 Rich Sample PDF Documents", type="secondary"):
+        generate_rich_sample_pdfs(SAMPLES_DIR)
+        st.success("Sample PDF documents regenerated successfully in samples/ directory.")
 
 
 # =============================================================================
-# REUSABLE COMPONENT: DOCUMENT DETAIL PANEL
+# HELPER: SINGLE DOCUMENT DETAILS COMPONENT
 # =============================================================================
 
 def render_single_document_details(
     doc: Dict[str, Any],
     storage: FileStorageManager,
     db: DatabaseManager,
+    workflow: Optional[WorkflowEngine] = None,
+    audit: Optional[AuditService] = None,
     live_analysis: Optional[Dict[str, Any]] = None
 ):
-    """Renders a comprehensive, SaaS-grade document detail view."""
-    st.markdown(f"""
-        <div style="background-color: #F8FAFC; border: 1px solid #CBD5E1; border-radius: 10px; padding: 1.2rem; margin-bottom: 1.0rem;">
-            <div style="display: flex; justify-content: space-between; align-items: center;">
-                <h3 style="margin: 0; color: #0F172A;">{doc['original_filename']}</h3>
-                <div>
-                    {render_type_badge(doc['document_type'])}
-                    {render_status_badge(doc['status'])}
-                </div>
-            </div>
-            <div style="font-size: 0.85rem; color: #64748B; margin-top: 0.35rem;">
-                <strong>Document ID:</strong> #{doc['id']} | 
-                <strong>Stored Filename:</strong> <code>{doc['stored_filename']}</code> | 
-                <strong>Uploaded:</strong> {doc['upload_date'][:19].replace('T', ' ')}
-            </div>
-        </div>
-    """, unsafe_allow_html=True)
-
-    if doc.get("status_reason"):
-        if doc["status"] == STATUS_NEEDS_REVIEW:
-            st.warning(f"⚠️ **Review Advisory:** {doc['status_reason']}")
-        elif doc["status"] == STATUS_FAILED:
-            st.error(f"✕ **Failure Reason:** {doc['status_reason']}")
+    metadata = doc.get("metadata", {})
+    doc_id = doc["id"]
 
     col_meta, col_fields = st.columns([1, 1])
 
     with col_meta:
-        st.markdown("##### 📌 Cryptographic & Storage Metadata")
-        st.write(f"**SHA-256 Digest:**")
-        st.code(doc["file_hash"], language="text")
-        st.write(f"**Storage Path:** `{doc['file_path']}`")
-
-        metadata = doc.get("metadata", {})
-        if metadata:
-            st.write(f"**Model Used:** `{metadata.get('classification_model', 'N/A')}`")
-            st.write(f"**Classifier Confidence:** `{metadata.get('confidence', 'N/A')}`")
-            st.write(f"**OCR Fallback Used:** `{'Yes' if metadata.get('ocr_used') else 'No'}`")
-            st.write(f"**Word Count:** `{metadata.get('word_count', 0)} words`")
+        st.markdown("##### 📌 Document Record Summary")
+        st.markdown(f"**Document ID:** `#{doc_id}`")
+        st.markdown(f"**Original Filename:** `{doc['original_filename']}`")
+        st.markdown(f"**Category:** <span class='badge-type'>{doc['document_type']}</span>", unsafe_allow_html=True)
+        st.markdown(f"**Workflow Status:** {render_status_badge(doc['status'])}", unsafe_allow_html=True)
+        st.markdown(f"**Status Reason:** `{doc.get('status_reason', '—')}`")
+        st.markdown(render_confidence_badge(doc.get("confidence_score")), unsafe_allow_html=True)
+        st.markdown(f"**SHA-256 Digest:** `{doc.get('file_hash', '—')[:24]}...`")
 
         # Download Stored File
         file_bytes = storage.read_file(doc["file_path"])
         if file_bytes:
             st.download_button(
-                label=f"📥 Download Stored File ({doc['original_filename']})",
+                label=f"📥 Download Stored File",
                 data=file_bytes,
                 file_name=doc["original_filename"],
                 mime="application/pdf" if doc["original_filename"].lower().endswith(".pdf") else "image/png",
@@ -860,13 +1051,12 @@ def render_single_document_details(
             )
 
     with col_fields:
-        st.markdown("##### 📋 Extracted Structured Fields")
+        st.markdown("##### 📋 Extracted Entities")
         if doc["document_type"] == TYPE_INVOICE:
             fields_data = [
                 ("Invoice Number", doc.get("invoice_number", "Not Found")),
                 ("Company Name", doc.get("company", "Not Found")),
                 ("Total Amount", doc.get("total_amount", "Not Found")),
-                ("Date", metadata.get("fields", {}).get("Date", "Not Found"))
             ]
         elif doc["document_type"] == TYPE_RESUME:
             fields_data = [
@@ -881,41 +1071,30 @@ def render_single_document_details(
             ]
 
         for k, v in fields_data:
-            val_style = "color: #0F172A; font-weight: 600;"
-            if v == "Not Found":
-                val_style = "color: #94A3B8; font-style: italic;"
+            val_style = "color: #94A3B8; font-style: italic;" if v == "Not Found" else "color: #0F172A; font-weight: 600;"
             st.markdown(f"**{k}:** <span style='{val_style}'>{v}</span>", unsafe_allow_html=True)
 
-    # Text Preview Expander
-    with st.expander("📄 Document Text Preview (First 1,000 Characters)", expanded=False):
-        st.text_area("Extracted Clean Text", doc.get("text_preview", ""), height=200, disabled=True)
+    # Document Text Preview
+    with st.expander("📄 Document Text Preview", expanded=False):
+        st.text_area("Extracted Clean Text", doc.get("text_preview", ""), height=150, disabled=True)
 
-    # Actions Row: Delete or Change Status
-    c_act1, c_act2 = st.columns([1, 1])
-    with c_act1:
-        new_status = st.selectbox(
-            "Change Status:",
-            ALL_STATUSES,
-            index=ALL_STATUSES.index(doc["status"]),
-            key=f"status_select_{doc['id']}"
-        )
-        if new_status != doc["status"]:
-            db.update_document_status(doc["id"], new_status, "Manually updated by reviewer.")
-            st.success(f"Status updated to '{new_status}'")
-            st.rerun()
-
-    with c_act2:
-        st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("🗑️ Delete Document Record", key=f"del_doc_{doc['id']}", type="secondary"):
-            deleted_record = db.delete_document(doc["id"])
-            if deleted_record:
-                storage.delete_file(deleted_record["file_path"])
-                st.success("Document and stored file removed cleanly from repository.")
-                st.rerun()
+    # Document Audit Timeline
+    audit_svc = audit or get_audit_service(db)
+    history = audit_svc.get_document_history(doc_id)
+    if history:
+        with st.expander(f"📜 View Lifecycle Audit Trail ({len(history)} events recorded)", expanded=False):
+            for h in history:
+                note_str = f" | Note: {h['reviewer_note']}" if h.get('reviewer_note') else ""
+                st.markdown(f"""
+                    <div class="audit-item">
+                        <strong>{h['action']}</strong>: <code>{h['previous_status']}</code> → <code>{h['new_status']}</code>
+                        <br><small style="color: #64748B;">{h['timestamp'][:19].replace('T', ' ')} | {h.get('reason') or ''}{note_str}</small>
+                    </div>
+                """, unsafe_allow_html=True)
 
 
 # =============================================================================
-# MAIN CONTROLLER & NAVIGATION
+# MAIN CONTROLLER & APPLICATION ENTRYPOINT
 # =============================================================================
 
 def main():
@@ -928,45 +1107,58 @@ def main():
 
     apply_custom_css()
 
-    # Initialize backend
-    db, storage, clf, ocr_engine, processor, eval_results = initialize_system(full=True)
+    db, storage, clf, ocr_engine, processor, batch_proc, workflow, audit, eval_results = initialize_system(full=True)
 
     # Sidebar Navigation
     with st.sidebar:
         st.markdown("### 📄 AI Document Intelligence")
-        st.caption("Enterprise Document Workflow Platform • Week 4")
+        st.caption("Advanced Document Workflow & Automation Platform • Week 5")
         st.markdown("---")
 
-        page = st.radio(
-            "Navigation:",
-            [
-                "🏠 Dashboard",
-                "📤 Upload Document",
-                "🔎 Search Documents",
-                "📁 Document Repository",
-                "📊 Analytics & Benchmark",
-                "⚙️ Settings & Health"
-            ],
-            index=0
-        )
+        nav_options = [
+            "🏠 Dashboard",
+            "📤 Ingest & Workflow",
+            "⚡ Batch Processing",
+            "⚖️ Human Review Queue",
+            "🔎 Search & Filter",
+            "📁 Document Vault",
+            "📜 Audit Trail",
+            "📊 Analytics & Benchmark",
+            "⚙️ Settings & Health"
+        ]
+
+        # Read or set session state for nav selection
+        default_index = 0
+        if "nav_selection" in st.session_state and st.session_state["nav_selection"] in nav_options:
+            default_index = nav_options.index(st.session_state["nav_selection"])
+
+        page = st.radio("Navigation:", nav_options, index=default_index)
+        st.session_state["nav_selection"] = page
 
         st.markdown("---")
         stats = db.get_statistics()
-        st.markdown(f"**Repository Vault:** `{stats['total']}` files")
-        st.markdown(f"**Cleanly Processed:** `{stats['processed']}`")
+        st.markdown(f"**Total Vault:** `{stats['total']}` files")
+        st.markdown(f"**Completed:** `{stats['completed']}`")
         st.markdown(f"**Needs Review:** `{stats['needs_review']}`")
+        st.markdown(f"**Audit Logs:** `{stats['total_audit_events']}`")
         st.markdown("---")
         st.caption("AI/ML Document Intelligence Platform\nDeveloped by Sakthibalan S")
 
-    # Route Page
+    # Route Selected Page
     if page == "🏠 Dashboard":
-        render_dashboard(db, storage)
-    elif page == "📤 Upload Document":
+        render_dashboard(db, storage, workflow)
+    elif page == "📤 Ingest & Workflow":
         render_upload_page(db, storage, processor, clf)
-    elif page == "🔎 Search Documents":
+    elif page == "⚡ Batch Processing":
+        render_batch_page(db, storage, batch_proc, clf)
+    elif page == "⚖️ Human Review Queue":
+        render_review_queue_page(db, storage, workflow, audit)
+    elif page == "🔎 Search & Filter":
         render_search_page(db, storage)
-    elif page == "📁 Document Repository":
-        render_repository_page(db, storage)
+    elif page == "📁 Document Vault":
+        render_repository_page(db, storage, workflow, audit)
+    elif page == "📜 Audit Trail":
+        render_audit_trail_page(db, audit)
     elif page == "📊 Analytics & Benchmark":
         render_analytics_page(db, eval_results)
     elif page == "⚙️ Settings & Health":

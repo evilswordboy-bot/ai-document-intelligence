@@ -49,7 +49,7 @@ def test_e2e_invoice_workflow_and_persistence(integrated_processor):
     assert res["success"] is True
     assert res["is_duplicate"] is False
     assert res["document_type"] == "Invoice"
-    assert res["status"] == "Processed"
+    assert res["status"] in ("Completed", "Processed")
     assert res["fields"]["Invoice Number"] == "INV-2026-001"
     assert res["fields"]["Total Amount"] == "$ 1,450.00"
 
@@ -64,7 +64,7 @@ def test_e2e_invoice_workflow_and_persistence(integrated_processor):
     db_record = db.get_document_by_id(doc_id)
     assert db_record is not None
     assert db_record["company"] == "TechCorp Solutions Inc."
-    assert db_record["status"] == "Processed"
+    assert db_record["status"] in ("Completed", "Processed")
 
     # 2. Second upload: Identical file -> DUPLICATE DETECTION
     dup_res = proc.process_and_store(file_bytes, "invoice_1_copy.pdf")

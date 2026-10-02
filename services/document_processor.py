@@ -1,9 +1,7 @@
 """
-Document Processor Service.
-Orchestrates the complete Week 4 Document Intelligence Workflow:
-Validation -> SHA-256 Hashing -> Duplicate Detection -> Text Extraction / OCR
--> Text Cleaning -> ML Classification -> Entity Extraction -> Status Assignment
--> Physical Storage -> SQLite Persistence.
+Document Processor Service for AI Document Intelligence & Workflow Platform.
+Orchestrates the complete Week 5 automated lifecycle:
+UPLOAD -> PROCESS -> CLASSIFY -> EXTRACT -> VALIDATE -> APPLY RULES -> REVIEW / APPROVE / REJECT -> COMPLETE -> AUDIT HISTORY
 """
 
 import os
@@ -14,8 +12,13 @@ from typing import Dict, Any, Optional, Tuple
 from database.db import DatabaseManager, get_db
 from models.document import (
     DocumentRecord,
-    STATUS_PROCESSED,
+    STATUS_NEW,
+    STATUS_PROCESSING,
     STATUS_NEEDS_REVIEW,
+    STATUS_APPROVED,
+    STATUS_REJECTED,
+    STATUS_COMPLETED,
+    STATUS_PROCESSED,
     STATUS_FAILED,
     TYPE_INVOICE,
     TYPE_RESUME,
@@ -23,7 +26,21 @@ from models.document import (
 )
 from services.hashing import calculate_sha256
 from services.file_storage import FileStorageManager, get_storage_manager
-from services.validation import FileValidator
+from services.validation import FileValidator, DocumentValidator
+from services.audit import (
+    AuditService,
+    get_audit_service,
+    ACTION_UPLOADED,
+    ACTION_PROCESSING_STARTED,
+    ACTION_CLASSIFIED,
+    ACTION_EXTRACTED,
+    ACTION_VALIDATION_PASSED,
+    ACTION_VALIDATION_FAILED,
+    ACTION_ROUTED_TO_REVIEW,
+    ACTION_ROUTED_TO_COMPLETED,
+    ACTION_WORKFLOW_FAILED,
+)
+from services.workflow import WorkflowEngine, get_workflow_engine
 from src.document_reader import DocumentReader
 from src.ocr_processor import OCRProcessor
 from src.text_cleaner import TextCleaner
@@ -32,19 +49,23 @@ from src.extractor import DocumentExtractor, NOT_FOUND
 
 
 class DocumentProcessor:
-    """End-to-end controller for document intake, intelligence pipeline, and persistence."""
+    """End-to-end controller for document intake, intelligence pipeline, validation, rules, and audit persistence."""
 
     def __init__(
         self,
         db_manager: Optional[DatabaseManager] = None,
         storage_manager: Optional[FileStorageManager] = None,
         classifier: Optional[DocumentClassifier] = None,
-        ocr_engine: Optional[OCRProcessor] = None
+        ocr_engine: Optional[OCRProcessor] = None,
+        audit_service: Optional[AuditService] = None,
+        workflow_engine: Optional[WorkflowEngine] = None
     ):
         self.db = db_manager or get_db()
         self.storage = storage_manager or get_storage_manager()
         self.classifier = classifier or DocumentClassifier()
         self.ocr_engine = ocr_engine or OCRProcessor()
+        self.audit = audit_service or get_audit_service(self.db)
+        self.workflow = workflow_engine or get_workflow_engine(self.db, self.audit)
 
     def process_and_store(
         self,
@@ -54,14 +75,15 @@ class DocumentProcessor:
         ocr_settings: Optional[Dict[str, bool]] = None
     ) -> Dict[str, Any]:
         """
-        Executes the full pipeline. Detects duplicates before parsing.
-        Persists newly parsed documents to storage and database.
+        Executes the full document intelligence workflow:
+        Intake -> Hashing -> Duplicate Suppression -> Text/OCR -> Classification
+        -> Extraction -> Advanced Validation -> Rule-Based Routing -> Audit Trail -> Storage.
         """
         ocr_opts = ocr_settings or {"preprocess": True}
         stages = []
 
         # -------------------------------------------------------------
-        # 1. Validation
+        # 1. File Validation
         # -------------------------------------------------------------
         is_valid, ext_clean, val_error = FileValidator.validate_file(original_filename, file_bytes)
         if not is_valid:
@@ -69,7 +91,8 @@ class DocumentProcessor:
                 "success": False,
                 "is_duplicate": False,
                 "error": val_error,
-                "stages": ["Validation Failed"]
+                "status": STATUS_FAILED,
+                "stages": ["File Validation Failed"]
             }
         stages.append("File Validated")
 
@@ -95,6 +118,7 @@ class DocumentProcessor:
                     "Skipping duplicate file creation and database write."
                 ),
                 "document": existing_doc,
+                "status": existing_doc.get("status") or existing_doc.get("current_status"),
                 "stages": stages
             }
 
@@ -109,7 +133,6 @@ class DocumentProcessor:
         if ext_clean == "pdf":
             read_res = DocumentReader.read_pdf(file_bytes)
             if read_res["error"]:
-                # Record as failed document
                 return self._store_failed_document(
                     file_bytes, original_filename, file_hash, "Unreadable",
                     read_res["error"], stages
@@ -120,7 +143,7 @@ class DocumentProcessor:
                 raw_text = ocr_res["text"]
                 ocr_used = True
                 ocr_steps = ocr_res.get("preprocessing_steps", [])
-                extraction_note = "Scanned PDF detected — executed OCR fallback."
+                extraction_note = "Scanned PDF detected — executed OCR computer vision fallback."
             else:
                 raw_text = read_res["text"]
                 extraction_note = f"Direct PyMuPDF selectable text extracted ({read_res['page_count']} page(s))."
@@ -152,7 +175,8 @@ class DocumentProcessor:
         # -------------------------------------------------------------
         pred_res = self.classifier.predict(cleaned_text, model_name=active_model_name)
         doc_type = pred_res["document_type"]
-        confidence = pred_res["confidence"]
+        confidence_str = pred_res.get("confidence", "Not Available")
+        confidence_val = pred_res.get("confidence_val")
         stages.append("Document Classified")
 
         # -------------------------------------------------------------
@@ -164,13 +188,24 @@ class DocumentProcessor:
         stages.append("Fields Extracted")
 
         # -------------------------------------------------------------
-        # 8. Status Determination
+        # 8. Advanced Document Validation (Week 5)
         # -------------------------------------------------------------
-        status, status_reason = self._determine_status(doc_type, fields, missing_fields, pred_res)
-        stages.append("Status Evaluated")
+        val_result = DocumentValidator.validate_document(doc_type, fields, cleaned_text)
+        stages.append("Validation Completed")
 
         # -------------------------------------------------------------
-        # 9. Structured Physical Storage
+        # 9. Rule-Based Workflow Engine Routing (Week 5)
+        # -------------------------------------------------------------
+        target_status, routing_action, routing_reason = self.workflow.evaluate_rules(
+            doc_type=doc_type,
+            validation_result=val_result,
+            confidence=confidence_val if confidence_val is not None else confidence_str,
+            text_valid=True
+        )
+        stages.append(f"Routed to {target_status}")
+
+        # -------------------------------------------------------------
+        # 10. Structured Physical Storage
         # -------------------------------------------------------------
         stored_filename, relative_path = self.storage.save_file(
             file_bytes=file_bytes,
@@ -181,9 +216,8 @@ class DocumentProcessor:
         stages.append("File Stored")
 
         # -------------------------------------------------------------
-        # 10. Database Persistence
+        # 11. Database Persistence
         # -------------------------------------------------------------
-        # Map extracted entities to database columns
         company = fields.get("Company Name", NOT_FOUND)
         invoice_number = fields.get("Invoice Number", NOT_FOUND)
         total_amount = fields.get("Total Amount", NOT_FOUND)
@@ -195,12 +229,16 @@ class DocumentProcessor:
 
         metadata_dict = {
             "classification_model": active_model_name,
-            "confidence": confidence,
+            "confidence": confidence_str,
+            "confidence_val": confidence_val,
             "probabilities": pred_res.get("probabilities"),
             "ocr_used": ocr_used,
             "ocr_steps": ocr_steps,
             "extraction_note": extraction_note,
-            "missing_fields": missing_fields,
+            "missing_fields": val_result.get("missing_fields", missing_fields),
+            "invalid_fields": val_result.get("invalid_fields", []),
+            "passed_fields": val_result.get("passed_fields", []),
+            "validation_reasons": val_result.get("reasons", []),
             "word_count": len(cleaned_text.split()),
             "char_count_original": clean_res["char_count_original"],
             "char_count_cleaned": clean_res["char_count_cleaned"],
@@ -223,13 +261,85 @@ class DocumentProcessor:
             "file_path": relative_path,
             "text_preview": cleaned_text[:1000],
             "file_hash": file_hash,
-            "status": status,
-            "status_reason": status_reason,
+            "status": target_status,
+            "current_status": target_status,
+            "status_reason": routing_reason,
+            "predicted_type": doc_type,
+            "confidence_score": confidence_val,
+            "validation_result_json": val_result,
+            "missing_fields_json": val_result.get("missing_fields", []),
+            "invalid_fields_json": val_result.get("invalid_fields", []),
             "metadata_json": metadata_dict
         }
 
         doc_id = self.db.add_document(doc_record)
         stages.append("Metadata Saved to SQLite")
+
+        # -------------------------------------------------------------
+        # 12. Audit Logging Trail (Week 5)
+        # -------------------------------------------------------------
+        # Event 1: Intake Uploaded
+        self.audit.record_event(
+            document_id=doc_id,
+            action=ACTION_UPLOADED,
+            previous_status=None,
+            new_status=STATUS_NEW,
+            reason=f"Uploaded '{original_filename}' ({len(file_bytes)} bytes)."
+        )
+
+        # Event 2: Processing Pipeline Triggered
+        self.audit.record_event(
+            document_id=doc_id,
+            action=ACTION_PROCESSING_STARTED,
+            previous_status=STATUS_NEW,
+            new_status=STATUS_PROCESSING,
+            reason=f"Executed OCR/PyMuPDF text extraction ({extraction_note})."
+        )
+
+        # Event 3: Classification
+        if confidence_val is not None:
+            conf_str = f"confidence {confidence_val:.1%}"
+        elif confidence_str and confidence_str != "Not Available":
+            conf_str = f"confidence {confidence_str}"
+        else:
+            conf_str = "confidence uncalibrated"
+
+        self.audit.record_event(
+            document_id=doc_id,
+            action=ACTION_CLASSIFIED,
+            previous_status=STATUS_PROCESSING,
+            new_status=STATUS_PROCESSING,
+            reason=f"Classified as '{doc_type}' with {conf_str} via {active_model_name}."
+        )
+
+        # Event 4: Entity Extraction
+        self.audit.record_event(
+            document_id=doc_id,
+            action=ACTION_EXTRACTED,
+            previous_status=STATUS_PROCESSING,
+            new_status=STATUS_PROCESSING,
+            reason=f"Extracted {len(fields)} fields ({len(missing_fields)} missing)."
+        )
+
+        # Event 5: Validation Result
+        val_action = ACTION_VALIDATION_PASSED if val_result["is_valid"] else ACTION_VALIDATION_FAILED
+        val_summary = "All field rules verified" if val_result["is_valid"] else "; ".join(val_result.get("reasons", ["Validation failed"]))
+        self.audit.record_event(
+            document_id=doc_id,
+            action=val_action,
+            previous_status=STATUS_PROCESSING,
+            new_status=STATUS_PROCESSING,
+            reason=val_summary
+        )
+
+        # Event 6: Final Routing to Target Status (Completed or Needs Review)
+        self.audit.record_event(
+            document_id=doc_id,
+            action=routing_action,
+            previous_status=STATUS_PROCESSING,
+            new_status=target_status,
+            reason=routing_reason
+        )
 
         saved_doc = self.db.get_document_by_id(doc_id)
 
@@ -240,11 +350,15 @@ class DocumentProcessor:
             "document": saved_doc,
             "file_hash": file_hash,
             "document_type": doc_type,
-            "confidence": confidence,
-            "status": status,
-            "status_reason": status_reason,
+            "confidence": confidence_str,
+            "confidence_val": confidence_val,
+            "status": target_status,
+            "status_reason": routing_reason,
+            "validation": val_result,
             "fields": fields,
-            "missing_fields": missing_fields,
+            "missing_fields": val_result.get("missing_fields", missing_fields),
+            "invalid_fields": val_result.get("invalid_fields", []),
+            "passed_fields": val_result.get("passed_fields", []),
             "original_text": raw_text,
             "cleaned_text": cleaned_text,
             "stored_filename": stored_filename,
@@ -254,46 +368,6 @@ class DocumentProcessor:
             "ocr_steps": ocr_steps,
             "error": None
         }
-
-    def _determine_status(
-        self,
-        doc_type: str,
-        fields: Dict[str, Any],
-        missing_fields: list,
-        pred_res: Dict[str, Any]
-    ) -> Tuple[str, str]:
-        """
-        Calculates honest processing status based on field completeness and confidence:
-        - Processed: High confidence and all key fields present.
-        - Needs Review: Document parsed, but critical fields are missing or require human review.
-        - Failed: Unreadable or corrupt.
-        """
-        if doc_type == TYPE_INVOICE:
-            critical_missing = []
-            if fields.get("Invoice Number") == NOT_FOUND:
-                critical_missing.append("Invoice Number")
-            if fields.get("Total Amount") == NOT_FOUND:
-                critical_missing.append("Total Amount")
-
-            if critical_missing:
-                return STATUS_NEEDS_REVIEW, f"Missing critical invoice field(s): {', '.join(critical_missing)}."
-            return STATUS_PROCESSED, "All primary invoice fields identified successfully."
-
-        elif doc_type == TYPE_RESUME:
-            critical_missing = []
-            if fields.get("Name") == NOT_FOUND:
-                critical_missing.append("Candidate Name")
-            if fields.get("Email") == NOT_FOUND:
-                critical_missing.append("Email Address")
-            if fields.get("Phone") == NOT_FOUND:
-                critical_missing.append("Phone Number")
-
-            if critical_missing:
-                return STATUS_NEEDS_REVIEW, f"Missing resume field(s): {', '.join(critical_missing)}."
-            return STATUS_PROCESSED, "Resume profile extracted cleanly."
-
-        else:
-            return STATUS_PROCESSED, "Document categorized as 'Other' and indexed for retrieval."
 
     def _store_failed_document(
         self,
@@ -306,7 +380,7 @@ class DocumentProcessor:
         raw_text: str = "",
         ocr_used: bool = False
     ) -> Dict[str, Any]:
-        """Safely saves unreadable or corrupt documents with 'Failed' status."""
+        """Safely saves unreadable or corrupt documents with 'Failed' status and full audit logging."""
         stored_filename, relative_path = self.storage.save_file(
             file_bytes, original_filename, "Other", file_hash
         )
@@ -327,7 +401,13 @@ class DocumentProcessor:
             "text_preview": raw_text[:500] if raw_text else "No legible text available.",
             "file_hash": file_hash,
             "status": STATUS_FAILED,
+            "current_status": STATUS_FAILED,
             "status_reason": error_msg,
+            "predicted_type": doc_type,
+            "confidence_score": None,
+            "validation_result_json": {"is_valid": False, "reasons": [error_msg]},
+            "missing_fields_json": [],
+            "invalid_fields_json": [],
             "metadata_json": {
                 "error": error_msg,
                 "ocr_used": ocr_used,
@@ -335,6 +415,23 @@ class DocumentProcessor:
             }
         }
         doc_id = self.db.add_document(doc_record)
+
+        # Audit events for failed intake
+        self.audit.record_event(
+            document_id=doc_id,
+            action=ACTION_UPLOADED,
+            previous_status=None,
+            new_status=STATUS_NEW,
+            reason=f"Uploaded '{original_filename}' ({len(file_bytes)} bytes)."
+        )
+        self.audit.record_event(
+            document_id=doc_id,
+            action=ACTION_WORKFLOW_FAILED,
+            previous_status=STATUS_NEW,
+            new_status=STATUS_FAILED,
+            reason=error_msg
+        )
+
         saved_doc = self.db.get_document_by_id(doc_id)
 
         return {
@@ -358,10 +455,14 @@ def get_document_processor(
     db_manager: Optional[DatabaseManager] = None,
     storage_manager: Optional[FileStorageManager] = None,
     classifier: Optional[DocumentClassifier] = None,
-    ocr_engine: Optional[OCRProcessor] = None
+    ocr_engine: Optional[OCRProcessor] = None,
+    audit_service: Optional[AuditService] = None,
+    workflow_engine: Optional[WorkflowEngine] = None
 ) -> DocumentProcessor:
     """Returns singleton instance of DocumentProcessor."""
     global _processor_singleton
     if _processor_singleton is None:
-        _processor_singleton = DocumentProcessor(db_manager, storage_manager, classifier, ocr_engine)
+        _processor_singleton = DocumentProcessor(
+            db_manager, storage_manager, classifier, ocr_engine, audit_service, workflow_engine
+        )
     return _processor_singleton
